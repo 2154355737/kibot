@@ -1,0 +1,26 @@
+{
+  "id": "jc",
+  "name": "教程Ai",
+  "version": "1.0.0",
+  "author": "Ki",
+  "description": "AI教程处理群类的关于kibot的搭建教程和回答",
+  "category": "utility",
+  "main": "index.js",
+  "dependencies": [],
+  "keywords": [],
+  "license": "MIT",
+  "engines": {
+    "kibot": ">=3.0.0",
+    "node": ">=18.0.0"
+  },
+  "permissions": [
+    "message.send",
+    "event.listen",
+    "storage.read",
+    "storage.write"
+  ],
+  "config": {
+    "enabled": false,
+    "debug": false
+  }
+}

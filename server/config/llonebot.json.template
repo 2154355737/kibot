@@ -1,0 +1,10 @@
+{
+  "_comment": "LLOneBot 连接配置 - 请运行 node init.js 进行配置",
+  "apiUrl": "",
+  "wsUrl": "",
+  "accessToken": "",
+  "heartbeatInterval": 30000,
+  "reconnectDelay": 5000,
+  "enabled": false
+}
+

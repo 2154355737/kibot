@@ -1,0 +1,25 @@
+[
+  {
+    "id": "default",
+    "name": "默认分组",
+    "description": "未分类的规则",
+    "color": "blue",
+    "expanded": true
+  },
+  {
+    "id": "fun",
+    "name": "娱乐功能",
+    "description": "娱乐相关的自动回复",
+    "color": "green",
+    "expanded": true
+  },
+  {
+    "id": "admin",
+    "name": "管理功能",
+    "description": "管理员专用功能",
+    "color": "red",
+    "expanded": true
+  }
+]
+
+

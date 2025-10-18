@@ -1,0 +1,31 @@
+{
+  "name": "kibot-websocket-server",
+  "version": "3.0.0",
+  "description": "WebSocket server for KiBot QQ robot management",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "init": "node init.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chalk": "^5.6.2",
+    "uuid": "^9.0.1",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/uuid": "^9.0.7",
+    "@types/ws": "^8.5.8"
+  },
+  "keywords": [
+    "websocket",
+    "qq",
+    "bot",
+    "llonebot"
+  ],
+  "author": "",
+  "license": "MIT"
+}

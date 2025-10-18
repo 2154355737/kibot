@@ -1,0 +1,64 @@
+[
+  {
+    "id": "default_hello",
+    "name": "问候回复",
+    "description": "当用户说你好时自动回复",
+    "enabled": true,
+    "eventType": "message",
+    "environment": "all",
+    "groupId": "default",
+    "priority": 1,
+    "cooldown": 0,
+    "adminOnly": false,
+    "conditions": [
+      {
+        "type": "keyword",
+        "operator": "contains",
+        "value": "你好"
+      }
+    ],
+    "actions": [
+      {
+        "type": "reply",
+        "params": {
+          "message": "你好！我是机器人助手，有什么可以帮助您的吗？",
+          "variables": false
+        }
+      }
+    ],
+    "triggerCount": 0,
+    "lastTriggered": null
+  },
+  {
+    "id": "default_time",
+    "name": "时间查询",
+    "description": "查询当前时间",
+    "enabled": true,
+    "eventType": "message",
+    "environment": "all",
+    "groupId": "fun",
+    "priority": 1,
+    "cooldown": 0,
+    "adminOnly": false,
+    "conditions": [
+      {
+        "type": "keyword",
+        "operator": "contains",
+        "value": "现在几点"
+      }
+    ],
+    "actions": [
+      {
+        "type": "reply",
+        "params": {
+          "message": "现在时间是：{time}",
+          "variables": true
+        }
+      }
+    ],
+    "triggerCount": 0,
+    "lastTriggered": null
+  }
+]
+
+

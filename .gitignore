@@ -1,0 +1,31 @@
+# Node modules
+node_modules/
+server/node_modules/
+
+# Logs
+*.log
+server/data/logs/
+
+# Config files with sensitive data
+server/config/llonebot.json
+server/config/security.json
+
+# Data files
+server/data/event-rules.json
+server/data/rule-groups.json
+server/data/monitor-stats.json
+server/data/tasks.json
+server/data/task-history.json
+server/data/plugins/plugin-configs.json
+server/data/plugins/*/storage.json
+server/data/monitoring/
+
+# Build files
+web/node_modules/
+*.tsbuildinfo
+
+# System files
+.DS_Store
+Thumbs.db
+*.swp
+

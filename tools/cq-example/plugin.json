@@ -1,0 +1,12 @@
+{
+  "id": "cq-example",
+  "name": "CQ码处理示例",
+  "version": "1.0.0",
+  "description": "演示如何处理CQ码消息段（图片、@、表情等）",
+  "author": "KiBot Team",
+  "main": "index.js",
+  "type": "enhanced",
+  "dependencies": [],
+  "permissions": ["event", "api"]
+}
+

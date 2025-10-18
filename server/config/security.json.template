@@ -1,0 +1,25 @@
+{
+  "authCodes": {
+    "admin": "请修改为你的管理员密码",
+    "operator": "请修改为你的操作员密码",
+    "viewer": "请修改为你的查看者密码",
+    "guest": "请修改为你的访客密码"
+  },
+  "session": {
+    "expireTime": 86400000,
+    "maxConcurrent": 5,
+    "renewThreshold": 7200000
+  },
+  "security": {
+    "maxLoginAttempts": 5,
+    "lockoutDuration": 900000,
+    "ipWhitelist": [],
+    "requireSecureCode": true
+  },
+  "rateLimit": {
+    "windowMs": 60000,
+    "max": 100
+  }
+}
+
+

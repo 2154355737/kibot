@@ -1,0 +1,14 @@
+{
+  "dailyMessageCount": 0,
+  "totalRulesTriggered": 0,
+  "totalApiCalls": 0,
+  "totalErrors": 0,
+  "messageHistory": [],
+  "userActivity": {},
+  "groupActivity": {},
+  "keywordStats": {},
+  "lastSaved": null,
+  "startTime": null
+}
+
+
