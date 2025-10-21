@@ -5,6 +5,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // 插件基础接口
 export class PluginBase {
@@ -516,7 +521,7 @@ export class PluginContext {
   }
 
   createStorage(pluginId) {
-    const storageDir = path.join(process.cwd(), 'data', 'plugins', pluginId);
+    const storageDir = path.join(__dirname, '../../data/plugins', pluginId);
     
     // 确保存储目录存在
     if (!fs.existsSync(storageDir)) {

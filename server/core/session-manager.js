@@ -2,6 +2,11 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 /**
  * 会话管理器 - 负责用户认证和会话管理
@@ -24,18 +29,13 @@ export class SessionManager {
    */
   loadSecurityConfig() {
     try {
-      // 尝试多个可能的路径（兼容不同的启动方式）
-      const possiblePaths = [
-        path.join(process.cwd(), 'config', 'security.json'),        // 从 server 目录启动
-        path.join(process.cwd(), 'server', 'config', 'security.json') // 从项目根目录启动
-      ];
+      // 使用相对于当前模块的路径（确保路径正确）
+      const securityPath = path.join(__dirname, '../config/security.json');
       
-      for (const configPath of possiblePaths) {
-        if (fs.existsSync(configPath)) {
-          const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-          console.log('📋 已加载安全配置文件:', configPath);
-          return config;
-        }
+      if (fs.existsSync(securityPath)) {
+        const config = JSON.parse(fs.readFileSync(securityPath, 'utf8'));
+        console.log('📋 已加载安全配置文件:', securityPath);
+        return config;
       }
       
       console.warn('⚠️ 未找到安全配置文件，使用默认配置');
@@ -354,29 +354,17 @@ export class SessionManager {
     
     // 保存配置到文件
     try {
-      // 尝试保存到正确的路径（兼容不同的启动方式）
-      const possibleDirs = [
-        path.join(process.cwd(), 'config'),           // 从 server 目录启动
-        path.join(process.cwd(), 'server', 'config')  // 从项目根目录启动
-      ];
+      // 使用相对于当前模块的路径
+      const configDir = path.join(__dirname, '../config');
       
-      let configPath = null;
-      for (const configDir of possibleDirs) {
-        if (fs.existsSync(configDir) || fs.existsSync(path.dirname(configDir))) {
-          if (!fs.existsSync(configDir)) {
-            fs.mkdirSync(configDir, { recursive: true });
-          }
-          configPath = path.join(configDir, 'security.json');
-          break;
-        }
+      // 确保目录存在
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
       }
       
-      if (configPath) {
-        fs.writeFileSync(configPath, JSON.stringify(this.config, null, 2));
-        console.log('💾 安全配置已保存:', configPath);
-      } else {
-        throw new Error('无法确定配置文件保存路径');
-      }
+      const securityPath = path.join(configDir, 'security.json');
+      fs.writeFileSync(securityPath, JSON.stringify(this.config, null, 2));
+      console.log('💾 安全配置已保存:', securityPath);
     } catch (error) {
       console.error('❌ 保存安全配置失败:', error);
     }

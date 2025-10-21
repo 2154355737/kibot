@@ -5,7 +5,12 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import { getLocalTime, getLocalDate, getLocalDateTime, createTimestamp } from './timezone-helper.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 export class OutputManager {
   constructor() {
@@ -27,7 +32,7 @@ export class OutputManager {
     this.wsClients = new Set();
     
     // 日志文件配置
-    this.logDirectory = path.join(process.cwd(), 'data', 'logs');
+    this.logDirectory = path.join(__dirname, '../data/logs');
     this.ensureLogDirectory();
     
     // 分类图标

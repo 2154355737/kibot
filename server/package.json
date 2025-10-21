@@ -1,13 +1,15 @@
 {
   "name": "kibot-websocket-server",
-  "version": "3.0.0",
+  "version": "1.4.9",
   "description": "WebSocket server for KiBot QQ robot management",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "init": "node init.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "update": "node update-backend.js",
+    "check-structure": "node tools/check-structure.js"
   },
   "dependencies": {
     "axios": "^1.6.0",

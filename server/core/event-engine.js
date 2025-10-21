@@ -1,8 +1,13 @@
 // 后端事件响应规则执行引擎
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import { logger } from '../utils/output-manager.js';
 import { translateText, LANG_MAP } from '../utils/tencent-translate.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // 默认管理员列表（可配置）
 const DEFAULT_ADMINS = [656906969]; // 根据实际需要配置
@@ -973,7 +978,7 @@ class EventResponseEngine {
   // 加载规则
   loadRules() {
     try {
-      const rulesPath = path.join(process.cwd(), 'server', 'data', 'event-rules.json');
+      const rulesPath = path.join(__dirname, '../data', 'event-rules.json');
       if (fs.existsSync(rulesPath)) {
         const savedRules = fs.readFileSync(rulesPath, 'utf8');
         this.rules = JSON.parse(savedRules);
@@ -993,7 +998,7 @@ class EventResponseEngine {
   // 保存规则
   saveRules() {
     try {
-      const dataDir = path.join(process.cwd(), 'server', 'data');
+      const dataDir = path.join(__dirname, '../data');
       if (!fs.existsSync(dataDir)) {
         fs.mkdirSync(dataDir, { recursive: true });
       }
@@ -2539,11 +2544,13 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
       
       // 记录消息历史（保留最近1000条）
       const messageRecord = {
+        messageId: event.message_id,
         timestamp: event.time * 1000,
-        userId: event.user_id,
-        groupId: event.group_id,
+        userId: event.user_id?.toString(),
+        groupId: event.group_id?.toString(),
         messageType: event.message_type,
-        content: messageContent.substring(0, 100), // 只保留前100个字符
+        contentType: 'text', // 消息内容类型
+        content: messageContent, // 完整内容，不截断
         senderName: event.sender?.nickname || event.sender?.card || '未知'
       };
       
@@ -2551,6 +2558,12 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
       if (this.stats.messageHistory.length > 1000) {
         this.stats.messageHistory = this.stats.messageHistory.slice(0, 1000);
       }
+      
+      console.log(`💾 已保存消息到历史记录 (总数: ${this.stats.messageHistory.length}):`, {
+        messageId: messageRecord.messageId,
+        from: messageRecord.senderName,
+        content: messageRecord.content.substring(0, 30)
+      });
       
       // 用户活跃度统计
       if (event.user_id) {
@@ -2686,7 +2699,7 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
   // 加载统计数据
   loadStats() {
     try {
-      const statsPath = path.join(process.cwd(), 'server', 'data', 'monitor-stats.json');
+      const statsPath = path.join(__dirname, '../data', 'monitor-stats.json');
       if (fs.existsSync(statsPath)) {
         const savedStats = fs.readFileSync(statsPath, 'utf8');
         const data = JSON.parse(savedStats);
@@ -2733,7 +2746,7 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
   // 保存统计数据
   saveStats() {
     try {
-      const dataDir = path.join(process.cwd(), 'server', 'data');
+      const dataDir = path.join(__dirname, '../data');
       if (!fs.existsSync(dataDir)) {
         fs.mkdirSync(dataDir, { recursive: true });
       }

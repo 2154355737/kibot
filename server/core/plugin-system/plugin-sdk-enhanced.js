@@ -488,7 +488,7 @@ export class EnhancedPluginBase extends EventEmitter {
     // 增强的storage
     this.storage = new EnhancedStorage(
       pluginInfo.id,
-      path.join(process.cwd(), 'data', 'plugins')
+      path.join(__dirname, '../../data/plugins')
     );
     
     // 事件处理器映射
@@ -756,6 +756,56 @@ export class EnhancedPluginBase extends EventEmitter {
   // 设置配置
   setConfig(key, value) {
     return this.storage.set(`config.${key}`, value);
+  }
+
+  /**
+   * 创建定时任务
+   * @param {string} name - 任务名称
+   * @param {string} cron - Cron表达式
+   * @param {Function} handler - 处理函数
+   */
+  schedule(name, cron, handler) {
+    const taskInfo = {
+      name,
+      cron,
+      registeredAt: Date.now(),
+      executionCount: 0,
+      lastExecuted: null,
+      lastError: null,
+      isActive: true
+    };
+    
+    // 包装处理器以记录统计信息
+    const wrappedHandler = async (...args) => {
+      this.lastActivity = Date.now();
+      this.statistics.tasksExecuted++;
+      taskInfo.executionCount++;
+      taskInfo.lastExecuted = Date.now();
+      
+      try {
+        const result = await handler(...args);
+        return result;
+      } catch (error) {
+        taskInfo.lastError = {
+          message: error.message,
+          stack: error.stack,
+          timestamp: Date.now()
+        };
+        this.recordError('task', name, error);
+        throw error;
+      }
+    };
+    
+    // 检查 scheduler 是否可用
+    if (this.context.scheduler) {
+      const task = this.context.scheduler.create(`${this.info.id}.${name}`, cron, wrappedHandler);
+      this.scheduledTasks.set(name, taskInfo);
+      this.logger.debug(`注册定时任务: ${name} (${cron})`);
+      return task;
+    } else {
+      this.logger.warn(`Scheduler 不可用，无法注册定时任务: ${name}`);
+      return null;
+    }
   }
 
   // 生命周期钩子(子类可覆盖)

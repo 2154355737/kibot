@@ -5,8 +5,13 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/output-manager.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 class TaskManager {
   constructor(mainServer) {
@@ -20,8 +25,8 @@ class TaskManager {
     this.apiCallback = null;
     this.broadcastCallback = null;
     
-    // 任务数据文件路径 - 修复路径问题
-    this.dataDir = path.join(process.cwd(), 'server', 'server', 'data');
+    // 任务数据文件路径 - 使用相对于当前模块的路径
+    this.dataDir = path.join(__dirname, '../data');
     this.tasksFile = path.join(this.dataDir, 'tasks.json');
     this.taskHistoryFile = path.join(this.dataDir, 'task-history.json');
     

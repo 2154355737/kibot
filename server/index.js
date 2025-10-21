@@ -16,6 +16,7 @@ import { monitorDataManager } from './utils/monitor-data-manager.js';
 import { needsInitialization, runInteractiveInitialization } from './init-helper.js';
 import { getTimezoneInfo } from './utils/timezone-helper.js';
 import './core/types.js';
+import { updaterService } from './core/updater-service.js';
 
 // ES模块中获取__dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -247,6 +248,35 @@ class KiBotWebSocketServer {
     logger.startup('任务管理器', '正在初始化...');
     this.taskManager = new TaskManager(this);
     
+    // 初始化更新器服务
+    logger.startup('更新系统', '初始化更新器服务...');
+    try {
+      // 确保更新器目录存在
+      const updatesDir = path.join(__dirname, '.updates');
+      if (!fs.existsSync(updatesDir)) {
+        fs.mkdirSync(updatesDir, { recursive: true });
+      }
+      
+      // 检查更新器脚本
+      const updaterScript = path.join(__dirname, 'update-backend.js');
+      if (fs.existsSync(updaterScript)) {
+        logger.success('更新系统', '更新器就绪 (运行 npm run update 可更新后端)');
+      } else {
+        logger.warning('更新系统', '更新器脚本未找到');
+      }
+      
+      // 检查备份数量
+      const backupDir = path.join(updatesDir, 'backups');
+      if (fs.existsSync(backupDir)) {
+        const backups = fs.readdirSync(backupDir).filter(f => f.startsWith('server-backup-'));
+        if (backups.length > 0) {
+          logger.info('更新系统', `发现 ${backups.length} 个历史备份`);
+        }
+      }
+    } catch (error) {
+      logger.warning('更新系统', '初始化警告: ' + error.message);
+    }
+    
     // 设置任务管理器的API回调
     this.taskManager.setApiCallback((action, params) => {
       return this.callLLOneBotViaWebSocket(action, params, uuidv4());
@@ -380,10 +410,16 @@ class KiBotWebSocketServer {
     const action = path.replace('/api/', '');
     
     try {
-      let requestBody = '';
+      // 检查是否为文件上传请求
+      const contentType = req.headers['content-type'] || '';
+      const isFileUpload = action === 'updater_upload' && contentType.includes('multipart/form-data');
       
-      // 读取请求体（对于POST/PUT请求）
-      if (method === 'POST' || method === 'PUT') {
+      let requestBody = '';
+      let params = {};
+      
+      // 对于文件上传，不在这里读取请求体（会在后续处理中读取）
+      if (!isFileUpload && (method === 'POST' || method === 'PUT')) {
+        // 读取请求体（对于非文件上传的POST/PUT请求）
         await new Promise((resolve, reject) => {
           req.on('data', chunk => {
             requestBody += chunk.toString();
@@ -397,22 +433,19 @@ class KiBotWebSocketServer {
             reject(new Error('请求体读取超时'));
           }, 10000);
         });
-      }
-      
-      // 解析请求参数
-      let params = {};
-      
-      if (method === 'GET') {
+        
+        // 解析 JSON 请求体
+        if (requestBody) {
+          try {
+            params = JSON.parse(requestBody);
+          } catch (error) {
+            throw new Error('请求体JSON格式错误');
+          }
+        }
+      } else if (method === 'GET') {
         // GET请求从URL参数获取
         for (const [key, value] of url.searchParams.entries()) {
           params[key] = value;
-        }
-      } else if (requestBody) {
-        // POST/PUT请求从请求体获取
-        try {
-          params = JSON.parse(requestBody);
-        } catch (error) {
-          throw new Error('请求体JSON格式错误');
         }
       }
       
@@ -489,7 +522,14 @@ class KiBotWebSocketServer {
       else if (action.startsWith('plugins_')) {
         response = await this.handleRulesApi(action, params);
       }
-      // 监控API
+      // 聊天相关API
+      else if (action === 'get_chat_list') {
+        response = await this.handleGetChatList(params);
+      }
+      else if (action === 'get_chat_history') {
+        response = await this.handleGetChatHistory(params);
+      }
+      // 监控API（使用新版API处理，支持归档、导出等高级功能）
       else if (action.startsWith('monitor_')) {
         response = await this.handleMonitorApiNew(action, params);
       }
@@ -509,8 +549,13 @@ class KiBotWebSocketServer {
       else if (action === 'get_status' || action === 'get_system_config' || 
                action === 'set_system_config' || action === 'reset_system_config' || 
                action === 'restart_service' || action === 'internal_security_stats' ||
-               action === 'generate_auth_code' || action === 'reload_security_config') {
+               action === 'generate_auth_code' || action === 'reload_security_config' ||
+               action === 'get_changelog') {
         response = await this.handleSystemApi(action, params);
+      }
+      // 更新器API
+      else if (action.startsWith('updater_')) {
+        response = await this.handleUpdaterApi(req, action, params);
       }
       // LLOneBot API（通过WebSocket转发）
       else {
@@ -2547,6 +2592,43 @@ class KiBotWebSocketServer {
             };
           }
 
+        case 'get_changelog':
+          // 获取更新日志
+          try {
+            const changelogPath = path.join(__dirname, 'data', 'changelog.json');
+            
+            if (fs.existsSync(changelogPath)) {
+              const changelogData = fs.readFileSync(changelogPath, 'utf8');
+              const changelog = JSON.parse(changelogData);
+              
+              return {
+                status: 'ok',
+                retcode: 0,
+                data: changelog,
+                message: '获取更新日志成功'
+              };
+            } else {
+              // 如果文件不存在，返回默认数据
+              return {
+                status: 'ok',
+                retcode: 0,
+                data: {
+                  version: '1.4.9',
+                  releaseDate: '2025-10-21',
+                  changelog: []
+                },
+                message: '更新日志文件不存在'
+              };
+            }
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `获取更新日志失败: ${error.message}`
+            };
+          }
+
         default:
           return {
             status: 'error',
@@ -2564,6 +2646,292 @@ class KiBotWebSocketServer {
         message: `系统API处理失败: ${error.message}`
       };
     }
+  }
+
+  /**
+   * 处理更新器API
+   * @param {Object} req - HTTP请求对象
+   * @param {string} action - API动作
+   * @param {Object} params - 参数
+   */
+  async handleUpdaterApi(req, action, params) {
+    try {
+      console.log(`🔄 处理更新器API: ${action}`);
+      
+      switch (action) {
+        case 'updater_status':
+          // 获取更新状态
+          const status = updaterService.getUpdateStatus();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: status,
+            message: '获取更新状态成功'
+          };
+
+        case 'updater_upload':
+          // 处理文件上传
+          try {
+            console.log('🔄 开始处理文件上传...');
+            
+            // 解析 multipart/form-data
+            const file = await this.parseMultipartFile(req);
+            
+            const result = await updaterService.handleUpload(file);
+            
+            console.log(`✅ 文件上传成功: ${file.originalname} (版本 ${result.version})`);
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: result,
+              message: '上传成功'
+            };
+          } catch (error) {
+            console.error('❌ 文件上传失败:', error.message);
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `上传失败: ${error.message}`
+            };
+          }
+
+        case 'updater_perform':
+          // 执行更新
+          try {
+            const { filepath } = params;
+            
+            if (!filepath) {
+              return {
+                status: 'error',
+                retcode: -1,
+                data: null,
+                message: '缺少更新包路径'
+              };
+            }
+
+            // 异步执行更新
+            updaterService.performUpdate(filepath).catch(err => {
+              console.error('更新执行失败:', err);
+            });
+
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: null,
+              message: '更新已开始，请通过status接口查看进度'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `启动更新失败: ${error.message}`
+            };
+          }
+
+        case 'updater_backups':
+          // 获取备份列表
+          const backups = updaterService.getBackupList();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: backups,
+            message: '获取备份列表成功'
+          };
+
+        case 'updater_logs':
+          // 获取更新日志列表
+          const logs = updaterService.getUpdateLogs();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: logs,
+            message: '获取更新日志列表成功'
+          };
+
+        case 'updater_log_content':
+          // 获取日志内容
+          try {
+            const { filename } = params;
+            
+            if (!filename) {
+              return {
+                status: 'error',
+                retcode: -1,
+                data: null,
+                message: '缺少日志文件名'
+              };
+            }
+
+            const logData = updaterService.getUpdateLogContent(filename);
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: logData,
+              message: '获取日志内容成功'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `获取日志内容失败: ${error.message}`
+            };
+          }
+
+        case 'updater_restore':
+          // 从备份恢复
+          try {
+            const { backupName } = params;
+            
+            if (!backupName) {
+              return {
+                status: 'error',
+                retcode: -1,
+                data: null,
+                message: '缺少备份名称'
+              };
+            }
+
+            const result = await updaterService.restoreFromBackup(backupName);
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: result,
+              message: '恢复成功，请重启服务器'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `恢复失败: ${error.message}`
+            };
+          }
+
+        default:
+          return {
+            status: 'error',
+            retcode: -1,
+            data: null,
+            message: `未知的更新器API动作: ${action}`
+          };
+      }
+    } catch (error) {
+      console.error(`🔄 更新器API处理错误 [${action}]:`, error);
+      return {
+        status: 'error',
+        retcode: -1,
+        data: null,
+        message: `更新器API处理失败: ${error.message}`
+      };
+    }
+  }
+
+  /**
+   * 解析multipart/form-data文件上传
+   */
+  async parseMultipartFile(req) {
+    return new Promise((resolve, reject) => {
+      try {
+        const contentType = req.headers['content-type'];
+        
+        if (!contentType || !contentType.includes('multipart/form-data')) {
+          reject(new Error('Content-Type必须是multipart/form-data'));
+          return;
+        }
+        
+        const boundaryMatch = contentType.match(/boundary=(.+?)(?:;|$)/);
+        if (!boundaryMatch) {
+          reject(new Error('无法解析boundary'));
+          return;
+        }
+        
+        const boundary = boundaryMatch[1];
+
+        const chunks = [];
+        let totalSize = 0;
+        let lastLogSize = 0;
+        
+        req.on('data', chunk => {
+          chunks.push(chunk);
+          totalSize += chunk.length;
+          
+          // 每接收 1MB 输出一次日志
+          if (totalSize - lastLogSize >= 1024 * 1024) {
+            console.log(`📦 正在接收文件: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+            lastLogSize = totalSize;
+          }
+        });
+        
+        req.on('end', () => {
+          try {
+            console.log(`📦 数据接收完成，总大小: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+            const buffer = Buffer.concat(chunks);
+            const boundaryBuffer = Buffer.from(`--${boundary}`);
+            
+            // 简单解析multipart数据
+            const parts = [];
+            let currentPos = 0;
+            
+            while (currentPos < buffer.length) {
+              const boundaryPos = buffer.indexOf(boundaryBuffer, currentPos);
+              if (boundaryPos === -1) break;
+              
+              const nextBoundaryPos = buffer.indexOf(boundaryBuffer, boundaryPos + boundaryBuffer.length);
+              if (nextBoundaryPos === -1) break;
+              
+              const part = buffer.slice(boundaryPos + boundaryBuffer.length, nextBoundaryPos);
+              parts.push(part);
+              
+              currentPos = nextBoundaryPos;
+            }
+
+            // 解析文件部分
+            for (const part of parts) {
+              const headerEndPos = part.indexOf('\r\n\r\n');
+              if (headerEndPos === -1) continue;
+              
+              const headers = part.slice(0, headerEndPos).toString();
+              const fileData = part.slice(headerEndPos + 4);
+              
+              // 提取文件名
+              const filenameMatch = headers.match(/filename="(.+?)"/);
+              if (filenameMatch) {
+                const filename = filenameMatch[1];
+                // 移除结尾的\r\n
+                const cleanData = fileData.slice(0, -2);
+                
+                console.log(`✅ 文件解析成功: ${filename} (${(cleanData.length / 1024 / 1024).toFixed(2)} MB)`);
+                
+                resolve({
+                  originalname: filename,
+                  buffer: cleanData
+                });
+                return;
+              }
+            }
+            
+            reject(new Error('未找到文件数据'));
+          } catch (error) {
+            console.error('❌ 解析multipart数据失败:', error);
+            reject(error);
+          }
+        });
+        
+        req.on('error', (error) => {
+          console.error('❌ 请求错误:', error);
+          reject(error);
+        });
+      } catch (error) {
+        console.error('❌ parseMultipartFile初始化失败:', error);
+        reject(error);
+      }
+    });
   }
 
   /**
@@ -2631,7 +2999,7 @@ class KiBotWebSocketServer {
           };
         
         case 'monitor_get_archives':
-          const archiveDir = path.join(process.cwd(), 'data', 'monitoring', 'archives');
+          const archiveDir = path.join(__dirname, 'data/monitoring/archives');
           let archives = [];
           
           try {
@@ -2698,8 +3066,7 @@ class KiBotWebSocketServer {
           };
         
         default:
-          // 回退到旧版API
-          return await this.handleMonitorApi(action, params);
+          throw new Error(`未知的监控API: ${action}`);
       }
     } catch (error) {
       console.error(`❌ 新版监控API处理失败: ${action}`, error);
@@ -2880,63 +3247,200 @@ class KiBotWebSocketServer {
   }
 
   /**
-   * 处理监控API
-   * @param {string} action - API动作
-   * @param {Object} params - 参数
+   * 获取聊天列表
+   * 直接从好友和群组列表构建，结合消息历史补充最后消息信息
    */
-  async handleMonitorApi(action, params) {
+  async handleGetChatList(params) {
     try {
-      console.log(`📊 监控API调用: ${action}`, params);
+      console.log('📋 获取聊天列表');
       
-      switch (action) {
-        case 'monitor_stats':
-          console.log('📊 收到监控统计API请求:', params);
-          try {
-            const monitorStats = await this.generateMonitorStats(params.timeRange || '24h');
-            console.log('✅ 监控统计数据生成成功');
-            console.log('📊 返回数据结构检查:');
-            console.log('  - realTimeStats:', !!monitorStats.realTimeStats);
-            console.log('  - messageStats:', !!monitorStats.messageStats);
-            console.log('  - userActivity:', !!monitorStats.userActivity);
-            console.log('  - systemStats:', !!monitorStats.systemStats);
-            console.log('  - contentAnalysis:', !!monitorStats.contentAnalysis);
-            
-            return {
-              status: 'ok',
-              retcode: 0,
-              data: monitorStats,
-              message: '获取监控统计成功'
-            };
-          } catch (error) {
-            console.error('❌ 生成监控统计数据失败:', error);
-            return {
-              status: 'error',
-              retcode: -1,
-              data: null,
-              message: `统计数据生成失败: ${error.message}`
-            };
-          }
-
-        case 'monitor_realtime':
-          console.log('📊 收到实时监控API请求:', params);
-          const realtimeStats = this.getRealtimeStats();
-          return {
-            status: 'ok',
-            retcode: 0,
-            data: realtimeStats,
-            message: '获取实时统计成功'
-          };
+      const chats = [];
+      
+      // 获取消息历史（用于补充最后消息信息）
+      const messageHistory = this.eventEngine ? (this.eventEngine.getStats()?.messageHistory || []) : [];
+      
+      // 创建消息映射表 key: chatId
+      const messageMap = new Map();
+      messageHistory.forEach(msg => {
+        const chatId = (msg.groupId || msg.userId)?.toString();
+        if (!chatId) return;
         
-        default:
-          throw new Error(`未知的监控API: ${action}`);
+        if (!messageMap.has(chatId)) {
+          messageMap.set(chatId, {
+            lastMessage: msg.content || '',
+            lastTime: msg.timestamp || 0,
+            senderName: msg.senderName || '未知',
+            messageCount: 1
+          });
+        } else {
+          const msgInfo = messageMap.get(chatId);
+          msgInfo.messageCount++;
+          // 更新为最新消息
+          if (msg.timestamp > msgInfo.lastTime) {
+            msgInfo.lastMessage = msg.content || '';
+            msgInfo.lastTime = msg.timestamp;
+            msgInfo.senderName = msg.senderName || '未知';
+          }
+        }
+      });
+      
+      // 1. 从好友列表构建私聊对话
+      try {
+        const friendsResponse = await this.callLLOneBotViaWebSocket('get_friend_list', {});
+        if (friendsResponse?.data) {
+          const friends = Array.isArray(friendsResponse.data) ? friendsResponse.data : [];
+          friends.forEach(friend => {
+            const chatId = friend.user_id?.toString();
+            if (!chatId) return;
+            
+            const msgInfo = messageMap.get(chatId) || {
+              lastMessage: '',
+              lastTime: 0,
+              senderName: '',
+              messageCount: 0
+            };
+            
+            chats.push({
+              chatId,
+              type: 'private',
+              name: friend.remark || friend.nickname || `好友${chatId}`,
+              avatar: friend.avatarUrl,
+              lastMessage: msgInfo.lastMessage,
+              lastTime: msgInfo.lastTime,
+              senderName: msgInfo.senderName,
+              messageCount: msgInfo.messageCount
+            });
+          });
+          console.log(`✅ 加载了 ${friends.length} 个好友对话`);
+        }
+      } catch (error) {
+        console.log('⚠️ 获取好友列表失败:', error.message);
       }
-    } catch (error) {
-      console.error(`❌ 监控API失败: ${action}`, error);
+      
+      // 2. 从群组列表构建群聊对话
+      try {
+        const groupsResponse = await this.callLLOneBotViaWebSocket('get_group_list', {});
+        if (groupsResponse?.data) {
+          const groups = Array.isArray(groupsResponse.data) ? groupsResponse.data : [];
+          groups.forEach(group => {
+            const chatId = group.group_id?.toString();
+            if (!chatId) return;
+            
+            const msgInfo = messageMap.get(chatId) || {
+              lastMessage: '',
+              lastTime: 0,
+              senderName: '',
+              messageCount: 0
+            };
+            
+            chats.push({
+              chatId,
+              type: 'group',
+              name: group.group_name || `群聊${chatId}`,
+              lastMessage: msgInfo.lastMessage,
+              lastTime: msgInfo.lastTime,
+              senderName: msgInfo.senderName,
+              messageCount: msgInfo.messageCount
+            });
+          });
+          console.log(`✅ 加载了 ${groups.length} 个群组对话`);
+        }
+      } catch (error) {
+        console.log('⚠️ 获取群组列表失败:', error.message);
+      }
+      
+      // 按最后消息时间排序（有消息的在前，按时间倒序）
+      chats.sort((a, b) => {
+        // 有消息的排在前面
+        if (a.lastTime && !b.lastTime) return -1;
+        if (!a.lastTime && b.lastTime) return 1;
+        // 都有消息，按时间排序
+        if (a.lastTime && b.lastTime) return b.lastTime - a.lastTime;
+        // 都没消息，按名称排序
+        return (a.name || '').localeCompare(b.name || '', 'zh-CN');
+      });
+      
+      console.log(`✅ 返回 ${chats.length} 个对话`);
+      
       return {
-        status: 'failed',
+        status: 'ok',
+        retcode: 0,
+        data: { chats },
+        message: '获取聊天列表成功'
+      };
+      
+    } catch (error) {
+      console.error('❌ 获取聊天列表失败:', error);
+      return {
+        status: 'error',
         retcode: -1,
-        data: null,
-        message: error.message || '监控API调用失败'
+        data: { chats: [] },
+        message: `获取聊天列表失败: ${error.message}`
+      };
+    }
+  }
+
+  /**
+   * 获取聊天历史记录
+   * @param {Object} params - 参数 { chatId, limit, before }
+   */
+  async handleGetChatHistory(params) {
+    try {
+      const { chatId, limit = 50, before } = params;
+      
+      console.log(`💬 获取聊天历史: chatId=${chatId}, limit=${limit}`);
+      
+      if (!this.eventEngine) {
+        return {
+          status: 'ok',
+          retcode: 0,
+          data: { messages: [], hasMore: false },
+          message: '事件引擎未初始化'
+        };
+      }
+      
+      // 获取消息历史
+      const stats = this.eventEngine.getStats();
+      let messages = (stats?.messageHistory || [])
+        .filter(msg => {
+          const msgChatId = msg.groupId || msg.userId;
+          return msgChatId?.toString() === chatId?.toString();
+        });
+      
+      // 如果指定了时间戳，只返回该时间之前的消息
+      if (before) {
+        messages = messages.filter(msg => msg.timestamp < before);
+      }
+      
+      // 按时间倒序排列（最新的在前）
+      messages.sort((a, b) => b.timestamp - a.timestamp);
+      
+      // 限制返回数量
+      const hasMore = messages.length > limit;
+      messages = messages.slice(0, limit);
+      
+      // 反转顺序（最旧的在前，最新的在后）
+      messages.reverse();
+      
+      console.log(`✅ 返回 ${messages.length} 条消息`);
+      
+      return {
+        status: 'ok',
+        retcode: 0,
+        data: {
+          messages,
+          hasMore
+        },
+        message: '获取聊天历史成功'
+      };
+      
+    } catch (error) {
+      console.error('❌ 获取聊天历史失败:', error);
+      return {
+        status: 'error',
+        retcode: -1,
+        data: { messages: [], hasMore: false },
+        message: `获取聊天历史失败: ${error.message}`
       };
     }
   }
@@ -2948,12 +3452,18 @@ class KiBotWebSocketServer {
    */
   handleSubscribe(clientId, message) {
     const client = this.clients.get(clientId);
-    if (!client) return;
+    if (!client) {
+      console.error(`❌ 订阅失败：客户端 ${clientId} 不存在`);
+      return;
+    }
 
     const { events = [] } = message;
     client.subscribedEvents = events;
     
-    console.log(`📡 客户端 ${clientId} 订阅事件:`, events);
+    console.log(`📡 [事件订阅] 客户端 ${clientId} 订阅事件:`, events);
+    console.log(`   客户端类型: ${client.clientType}`);
+    console.log(`   认证状态: ${client.authenticated}`);
+    console.log(`   已保存订阅列表:`, client.subscribedEvents);
     
     this.sendToClient(client.ws, {
       type: 'subscribe_response',
@@ -2962,6 +3472,8 @@ class KiBotWebSocketServer {
         message: '订阅成功'
       }
     });
+    
+    console.log(`✅ [事件订阅] 客户端 ${clientId} 订阅确认已发送`);
   }
 
   /**
@@ -3133,18 +3645,32 @@ class KiBotWebSocketServer {
    * @param {Object} event - 事件对象
    */
   broadcastEvent(event) {
-    // 静默广播（不输出日志）
+    // 添加调试日志
+    const eventType = event.post_type;
+    const clientCount = this.clients.size;
     
+    console.log(`📡 [广播事件] 类型: ${eventType}, 客户端数量: ${clientCount}`);
+    
+    let sentCount = 0;
     this.clients.forEach((client, clientId) => {
       // 检查客户端是否订阅了该事件类型
       const subscribedEvents = client.subscribedEvents || [];
-      if (subscribedEvents.length === 0 || subscribedEvents.includes(event.post_type)) {
+      
+      console.log(`   客户端 ${clientId}: 订阅=${JSON.stringify(subscribedEvents)}, 匹配=${subscribedEvents.length === 0 || subscribedEvents.includes(eventType)}`);
+      
+      if (subscribedEvents.length === 0 || subscribedEvents.includes(eventType)) {
         this.sendToClient(client.ws, {
           type: 'event',
           data: event
         });
+        sentCount++;
+        console.log(`   ✅ 已发送事件到客户端 ${clientId}`);
+      } else {
+        console.log(`   ⏭️ 客户端 ${clientId} 未订阅此事件类型`);
       }
     });
+    
+    console.log(`📡 [广播完成] 事件 ${eventType} 已发送到 ${sentCount}/${clientCount} 个客户端`);
   }
 
   /**
@@ -3206,7 +3732,7 @@ class KiBotWebSocketServer {
   // 加载分组
   loadGroups() {
     try {
-      const groupsPath = path.join(process.cwd(), 'server', 'data', 'rule-groups.json');
+      const groupsPath = path.join(__dirname, 'data', 'rule-groups.json');
       if (fs.existsSync(groupsPath)) {
         const savedGroups = fs.readFileSync(groupsPath, 'utf8');
         this.groups = JSON.parse(savedGroups);
@@ -3225,7 +3751,7 @@ class KiBotWebSocketServer {
   // 保存分组
   saveGroups() {
     try {
-      const dataDir = path.join(process.cwd(), 'server', 'data');
+      const dataDir = path.join(__dirname, 'data');
       if (!fs.existsSync(dataDir)) {
         fs.mkdirSync(dataDir, { recursive: true });
       }

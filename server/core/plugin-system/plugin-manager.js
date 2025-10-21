@@ -25,9 +25,9 @@ export class PluginManager extends EventEmitter {
     this.pluginDependencies = new Map(); // 依赖关系
     this.moduleCache = new Map(); // 模块缓存
     
-    // 插件目录 - 使用清晰的路径结构
-    this.pluginDir = path.join(process.cwd(), 'plugins');
-    this.dataDir = path.join(process.cwd(), 'data', 'plugins');
+    // 插件目录 - 使用相对于模块的路径（确保从任何目录启动都正确）
+    this.pluginDir = path.join(__dirname, '../../plugins');
+    this.dataDir = path.join(__dirname, '../../data/plugins');
     
     // 确保目录存在
     this.ensureDirectories();
@@ -345,6 +345,44 @@ export class PluginManager extends EventEmitter {
     }
     
     console.log(`✅ 插件重载完成: ${pluginId}`);
+  }
+
+  /**
+   * 删除插件（从文件系统中删除）
+   */
+  async removePlugin(pluginId) {
+    try {
+      console.log(`🗑️ 删除插件: ${pluginId}`);
+      
+      // 先卸载插件
+      await this.unloadPlugin(pluginId);
+      
+      // 删除插件目录
+      const pluginPath = path.join(this.pluginDir, pluginId);
+      if (fs.existsSync(pluginPath)) {
+        // 递归删除目录
+        fs.rmSync(pluginPath, { recursive: true, force: true });
+        console.log(`✅ 插件目录已删除: ${pluginPath}`);
+      }
+      
+      // 删除插件数据目录
+      const dataPath = path.join(this.dataDir, pluginId);
+      if (fs.existsSync(dataPath)) {
+        fs.rmSync(dataPath, { recursive: true, force: true });
+        console.log(`✅ 插件数据已删除: ${dataPath}`);
+      }
+      
+      // 从插件信息中移除
+      this.pluginInfos.delete(pluginId);
+      this.pluginConfigs.delete(pluginId);
+      
+      console.log(`✅ 插件删除完成: ${pluginId}`);
+      this.emit('pluginRemoved', pluginId);
+    } catch (error) {
+      console.error(`❌ 插件删除失败 ${pluginId}:`, error);
+      this.emit('pluginError', pluginId, error);
+      throw error;
+    }
   }
 
   /**

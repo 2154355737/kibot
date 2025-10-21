@@ -4,11 +4,16 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 import { logger } from './output-manager.js';
 
 export class MonitorDataManager {
   constructor() {
-    this.dataDir = path.join(process.cwd(), 'data', 'monitoring');
+    this.dataDir = path.join(__dirname, '../data/monitoring');
     this.currentStatsFile = path.join(this.dataDir, 'current-stats.json');
     this.archiveDir = path.join(this.dataDir, 'archives');
     
