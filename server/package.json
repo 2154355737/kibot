@@ -1,6 +1,6 @@
 {
   "name": "kibot-websocket-server",
-  "version": "1.4.9",
+  "version": "1.5.0",
   "description": "WebSocket server for KiBot QQ robot management",
   "main": "index.js",
   "type": "module",

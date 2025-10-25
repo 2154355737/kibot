@@ -982,7 +982,7 @@ class EventResponseEngine {
       if (fs.existsSync(rulesPath)) {
         const savedRules = fs.readFileSync(rulesPath, 'utf8');
         this.rules = JSON.parse(savedRules);
-        console.log(`📋 已加载 ${this.rules.length} 个事件规则`);
+        logger.info('事件规则', `已加载 ${this.rules.length} 个`);
       } else {
         // 创建默认规则
         this.rules = this.getDefaultRules();
@@ -2492,6 +2492,12 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
         rule.triggerCount++;
         rule.lastTriggered = new Date();
         this.stats.totalRulesTriggered++; // 增加总的规则触发统计
+        
+        // 记录到系统统计模块（需要在文件顶部导入）
+        if (typeof global.systemStatistics !== 'undefined') {
+          global.systemStatistics.recordRuleTriggered();
+        }
+        
         this.saveRules();
         console.log(`📊 规则触发统计更新: ${rule.name}, 总触发次数: ${this.stats.totalRulesTriggered}`);
       }
@@ -2559,11 +2565,7 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
         this.stats.messageHistory = this.stats.messageHistory.slice(0, 1000);
       }
       
-      console.log(`💾 已保存消息到历史记录 (总数: ${this.stats.messageHistory.length}):`, {
-        messageId: messageRecord.messageId,
-        from: messageRecord.senderName,
-        content: messageRecord.content.substring(0, 30)
-      });
+      logger.info('消息历史', `已保存 (总数: ${this.stats.messageHistory.length}) - ID: ${messageRecord.messageId}, 来自: ${messageRecord.senderName}, 内容: ${messageRecord.content.substring(0, 20)}...`);
       
       // 用户活跃度统计
       if (event.user_id) {
@@ -2722,21 +2724,9 @@ ${actualApiParams.duration > 0 ? `⏰ 禁言时长：${actualApiParams.duration}
         this.stats.totalErrors = data.totalErrors || 0;
         this.stats.messageHistory = data.messageHistory || [];
         
-        console.log('📊 统计数据已加载:', {
-          dailyMessageCount: this.stats.dailyMessageCount,
-          userActivityCount: this.stats.userActivity.size,
-          groupActivityCount: this.stats.groupActivity.size,
-          keywordCount: this.stats.keywordStats.size,
-          messageHistoryCount: this.stats.messageHistory.length
-        });
+        logger.info('统计数据', `消息${this.stats.dailyMessageCount}, 用户${this.stats.userActivity.size}, 群组${this.stats.groupActivity.size}, 关键词${this.stats.keywordStats.size}, 历史${this.stats.messageHistory.length}`);
       } else {
         console.log('📊 未找到历史统计数据，使用默认值');
-        console.log('📊 初始统计数据状态:', {
-          dailyMessageCount: this.stats.dailyMessageCount,
-          totalRulesTriggered: this.stats.totalRulesTriggered,
-          totalApiCalls: this.stats.totalApiCalls,
-          totalErrors: this.stats.totalErrors
-        });
       }
     } catch (error) {
       console.error('加载统计数据失败:', error);

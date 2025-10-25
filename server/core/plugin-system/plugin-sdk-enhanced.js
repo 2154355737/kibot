@@ -2,15 +2,33 @@
  * KiBot 增强插件SDK v3.0
  * 提供更优雅的API和开发体验
  * 
+ * 核心设计原则：
+ * 1. 性能统计和错误捕获在SDK层面强制执行，不可被插件覆盖
+ * 2. 所有命令、事件、任务的执行都自动追踪
+ * 3. 使用Symbol确保核心方法不被覆盖
+ * 
  * @module plugin-sdk-enhanced
- * @version 3.0.0
+ * @version 3.0.1
  * @author KiBot Team
  */
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import { CQParser, CQBuilder, MessageSegment } from '../../utils/cq-parser.js';
+import { getLocalTime } from '../../utils/timezone-helper.js';
+import { PluginStatistics } from './plugin-statistics.js';
+
+// 使用Symbol创建私有方法标识，防止插件覆盖核心功能
+const REGISTER_COMMAND_INTERNAL = Symbol('registerCommandInternal');
+const REGISTER_TASK_INTERNAL = Symbol('registerTaskInternal');
+const RECORD_ERROR_INTERNAL = Symbol('recordErrorInternal');
+const RECORD_PERFORMANCE_INTERNAL = Symbol('recordPerformanceInternal');
+
+// ES Modules 环境下需要手动创建 __dirname 和 __filename
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
  * 增强的数据存储层
@@ -384,7 +402,10 @@ export class EnhancedEventHandler {
     return this;
   }
 
-  // 执行事件处理
+  /**
+   * 【强制包装】执行事件处理
+   * SDK层面自动追踪所有事件处理的性能和错误
+   */
   async execute(event) {
     // 检查过滤器
     for (const filter of this.filters) {
@@ -393,18 +414,44 @@ export class EnhancedEventHandler {
       }
     }
 
-    // 执行中间件链
-    let index = 0;
-    const next = async () => {
-      if (index < this.middlewares.length) {
-        const middleware = this.middlewares[index++];
-        await middleware(event, next);
-      } else if (this.handler) {
-        await this.handler(event);
-      }
-    };
+    // ========== SDK强制执行：事件统计数据收集 ==========
+    this.pluginBase.stats.incrementEventHandled(this.eventType);
+    
+    // 并发监控
+    this.pluginBase.stats.incrementConcurrentOperations();
+    
+    const startTime = Date.now();
+    let success = true;
 
-    await next();
+    try {
+      // 执行中间件链
+      let index = 0;
+      const next = async () => {
+        if (index < this.middlewares.length) {
+          const middleware = this.middlewares[index++];
+          await middleware(event, next);
+        } else if (this.handler) {
+          await this.handler(event);
+        }
+      };
+
+      await next();
+    } catch (error) {
+      success = false;
+      
+      // ========== SDK强制执行：错误记录 ==========
+      this.pluginBase[RECORD_ERROR_INTERNAL]('event', this.eventType, error);
+      
+      // 继续抛出错误
+      throw error;
+    } finally {
+      // 并发监控
+      this.pluginBase.stats.decrementConcurrentOperations();
+      
+      // ========== SDK强制执行：性能记录 ==========
+      const duration = Date.now() - startTime;
+      this.pluginBase[RECORD_PERFORMANCE_INTERNAL]('event', this.eventType, duration, success);
+    }
   }
 }
 
@@ -496,18 +543,250 @@ export class EnhancedPluginBase extends EventEmitter {
     this.commandHandlers = new Map();
     this.enhancedEventHandlers = [];
     
-    // 统计信息
+    // 【统一统计模块】使用 PluginStatistics 管理所有统计数据
+    this.stats = new PluginStatistics(pluginInfo.id, this.storage);
+    
+    // 插件注册信息
     this.registeredCommands = new Map();
     this.usedRules = new Set();
     this.scheduledTasks = new Map();
-    this.errors = [];
-    this.lastActivity = Date.now();
-    this.statistics = {
-      commandExecutions: 0,
-      eventHandled: 0,
-      tasksExecuted: 0,
-      errorsOccurred: 0
+    
+    // 启动性能监控
+    this.startPerformanceMonitoring();
+    
+    // 【全局错误处理器】确保所有未捕获的错误都被记录
+    this._setupGlobalErrorHandlers();
+    
+    // 【核心保护机制】延迟执行，确保在子类构造函数执行后再保护
+    // 使用 setImmediate 在当前事件循环完成后执行
+    setImmediate(() => {
+      this._protectCoreProperties();
+    });
+  }
+  
+  /**
+   * 【核心保护机制】保护关键属性不被覆盖
+   * 在插件子类构造函数执行后调用，检测并修复被覆盖的核心属性
+   */
+  _protectCoreProperties() {
+    const protectedProperties = {
+      'stats': {
+        expected: 'PluginStatistics实例',
+        fix: () => {
+          // 如果被覆盖，保存自定义数据到 customStats，然后恢复正确的 stats
+          if (!(this.stats instanceof PluginStatistics)) {
+            this.logger.warn('⚠️ 检测到插件覆盖了 this.stats，已自动修复');
+            this.logger.warn('   请将自定义统计数据保存到 this.customStats 而不是 this.stats');
+            
+            // 保存被覆盖的数据到 customStats
+            this.customStats = this.stats;
+            
+            // 恢复正确的 PluginStatistics 实例
+            this.stats = new PluginStatistics(this.info.id, this.storage);
+            
+            this.logger.info('✅ 已恢复核心统计模块，你的自定义数据已迁移到 this.customStats');
+          }
+        }
+      },
+      'logger': {
+        expected: '增强Logger实例',
+        fix: () => {
+          if (!this.logger || typeof this.logger.info !== 'function') {
+            this.logger.warn('⚠️ 检测到插件覆盖了 this.logger，已自动修复');
+            this.logger = this._createEnhancedLogger(this.info.id);
+          }
+        }
+      },
+      'storage': {
+        expected: 'EnhancedStorage实例',
+        fix: () => {
+          if (!(this.storage instanceof EnhancedStorage)) {
+            this.logger.warn('⚠️ 检测到插件覆盖了 this.storage，已自动修复');
+            const oldStorage = this.storage;
+            this.storage = new EnhancedStorage(
+              this.info.id,
+              path.join(__dirname, '../../data/plugins')
+            );
+            // 尝试迁移数据
+            if (oldStorage && typeof oldStorage === 'object') {
+              this.customStorage = oldStorage;
+            }
+          }
+        }
+      }
     };
+    
+    // 检查并修复被覆盖的属性
+    let hasOverride = false;
+    for (const [propName, config] of Object.entries(protectedProperties)) {
+      try {
+        // 先检查是否被覆盖
+        const needsFix = (propName === 'stats' && !(this.stats instanceof PluginStatistics)) ||
+                         (propName === 'logger' && (!this.logger || typeof this.logger.info !== 'function')) ||
+                         (propName === 'storage' && !(this.storage instanceof EnhancedStorage));
+        
+        if (needsFix) {
+          hasOverride = true;
+          config.fix();
+        }
+        
+        // 使用 Object.defineProperty 防止再次被覆盖
+        const currentValue = this[propName];
+        Object.defineProperty(this, propName, {
+          value: currentValue,
+          writable: false,        // 不可写
+          configurable: false,    // 不可配置
+          enumerable: true
+        });
+      } catch (error) {
+        // 如果属性已经是不可配置的，忽略错误（说明已经保护过了）
+        if (error.message && !error.message.includes('Cannot redefine property')) {
+          this.logger.error(`保护属性 ${propName} 失败`, error);
+        }
+      }
+    }
+    
+    if (hasOverride) {
+      this.logger.warn('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      this.logger.warn('⚠️  插件开发注意事项：');
+      this.logger.warn('   不要在构造函数中覆盖以下核心属性：');
+      this.logger.warn('   • this.stats - 使用 this.customStats 代替');
+      this.logger.warn('   • this.logger - 使用父类提供的 logger');
+      this.logger.warn('   • this.storage - 使用父类提供的 storage');
+      this.logger.warn('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    }
+  }
+  
+  /**
+   * 【核心方法 - SDK层面全局错误处理】
+   * 设置全局错误处理器，捕获所有未处理的异常
+   * 确保插件的任何错误都不会被遗漏
+   */
+  _setupGlobalErrorHandlers() {
+    // 注意：process级别的错误处理器会影响整个进程
+    // 这里我们只捕获并记录，不阻止错误传播
+    
+    // 捕获未处理的Promise rejection
+    const unhandledRejectionHandler = (reason, promise) => {
+      // 检查是否来自当前插件
+      if (this._isPluginError(reason)) {
+        this[RECORD_ERROR_INTERNAL]('unhandledRejection', 'global', reason);
+        this.logger.error('捕获到未处理的Promise rejection', {
+          reason: reason?.message || String(reason)
+        });
+      }
+    };
+    
+    // 捕获未捕获的异常
+    const uncaughtExceptionHandler = (error, origin) => {
+      // 检查是否来自当前插件
+      if (this._isPluginError(error)) {
+        this[RECORD_ERROR_INTERNAL]('uncaughtException', 'global', error);
+        this.logger.error('捕获到未捕获的异常', {
+          error: error?.message || String(error),
+          origin
+        });
+      }
+    };
+    
+    // 存储处理器引用，以便后续清理
+    this._globalErrorHandlers = {
+      unhandledRejection: unhandledRejectionHandler,
+      uncaughtException: uncaughtExceptionHandler
+    };
+    
+    // 注册全局错误处理器
+    process.on('unhandledRejection', unhandledRejectionHandler);
+    process.on('uncaughtException', uncaughtExceptionHandler);
+    
+    this.logger.debug('全局错误处理器已启用');
+  }
+  
+  /**
+   * 判断错误是否来自当前插件
+   * 通过错误堆栈分析判断
+   */
+  _isPluginError(error) {
+    if (!error || !error.stack) return false;
+    
+    // 检查堆栈是否包含插件ID或插件目录
+    const stack = error.stack;
+    return stack.includes(this.info.id) || 
+           stack.includes(`plugins/${this.info.id}`) ||
+           stack.includes(`plugins\\${this.info.id}`);
+  }
+  
+  /**
+   * 清理全局错误处理器
+   * 在插件卸载时调用
+   */
+  _cleanupGlobalErrorHandlers() {
+    if (this._globalErrorHandlers) {
+      process.off('unhandledRejection', this._globalErrorHandlers.unhandledRejection);
+      process.off('uncaughtException', this._globalErrorHandlers.uncaughtException);
+      this._globalErrorHandlers = null;
+      this.logger.debug('全局错误处理器已清理');
+    }
+  }
+
+  /**
+   * 启动性能监控
+   */
+  startPerformanceMonitoring() {
+    // 立即记录一次基线内存
+    this.stats.recordMemoryUsage();
+    
+    // 每30秒记录一次内存使用
+    this.performanceInterval = setInterval(() => {
+      this.stats.recordMemoryUsage();
+    }, 30 * 1000);
+  }
+  
+  /**
+   * 停止性能监控
+   */
+  stopPerformanceMonitoring() {
+    if (this.performanceInterval) {
+      clearInterval(this.performanceInterval);
+      this.performanceInterval = null;
+    }
+  }
+  
+  /**
+   * 记录内存使用（委托给统计模块）
+   */
+  recordMemoryUsage() {
+    return this.stats.recordMemoryUsage();
+  }
+  
+  /**
+   * 【核心方法 - 不可覆盖】
+   * 性能数据记录的内部实现，委托给统一的统计模块
+   */
+  [RECORD_PERFORMANCE_INTERNAL](type, name, duration, success = true) {
+    return this.stats.recordPerformance(type, name, duration, success);
+  }
+  
+  /**
+   * 【公开API】记录性能数据
+   * 插件可以调用，但实际执行通过内部方法
+   */
+  recordPerformance(type, name, duration, success = true) {
+    return this[RECORD_PERFORMANCE_INTERNAL](type, name, duration, success);
+  }
+  
+  /**
+   * 检查异步并发安全（委托给统计模块）
+   */
+  checkAsyncSafety() {
+    return this.stats.checkAsyncSafety();
+  }
+  
+  /**
+   * 计算平均执行时间（委托给统计模块）
+   */
+  calculateAvgExecutionTime() {
+    return this.stats.calculateAvgExecutionTime();
   }
 
   // 创建增强的日志器
@@ -521,10 +800,17 @@ export class EnhancedPluginBase extends EventEmitter {
         timestamp: new Date().toISOString()
       };
       
-      // 输出日志
+      // 输出日志（添加时间戳，不展开metadata）
+      const timestamp = getLocalTime();
       const prefix = `[Plugin:${pluginId}]`;
       const emoji = { info: 'ℹ️', warn: '⚠️', error: '❌', debug: '🐛' }[level] || '📝';
-      console.log(`${prefix} ${emoji} ${message}`, metadata);
+      
+      // 不展开空对象，保持单行
+      if (metadata && Object.keys(metadata).length > 0) {
+        console.log(`[${timestamp}] ${prefix} ${emoji} ${message} ${JSON.stringify(metadata)}`);
+      } else {
+        console.log(`[${timestamp}] ${prefix} ${emoji} ${message}`);
+      }
       
       return logEntry;
     };
@@ -557,16 +843,27 @@ export class EnhancedPluginBase extends EventEmitter {
     // 按优先级排序
     this.enhancedEventHandlers.sort((a, b) => b.priority - a.priority);
     
-    // 创建包装的处理器
+    // 创建包装的处理器（添加性能监控）
     const wrappedHandler = async (event) => {
-      this.lastActivity = Date.now();
-      this.statistics.eventHandled++;
+      // 使用统计模块更新
+      this.stats.incrementEventHandled(handler.eventType);
+      
+      // 异步并发监控
+      this.stats.incrementConcurrentOperations();
+      
+      const startTime = Date.now();
+      let success = true;
       
       try {
         await handler.execute(event);
       } catch (error) {
+        success = false;
         this.recordError('event', handler.eventType, error);
         throw error;
+      } finally {
+        this.stats.decrementConcurrentOperations();
+        const duration = Date.now() - startTime;
+        this.recordPerformance('event', handler.eventType, duration, success);
       }
     };
     
@@ -587,26 +884,106 @@ export class EnhancedPluginBase extends EventEmitter {
     return new EnhancedEventHandler(this, eventType);
   }
 
-  // 记录错误
-  recordError(type, source, error) {
-    const errorInfo = {
-      type,
-      source,
-      message: error.message,
-      stack: error.stack,
-      timestamp: Date.now(),
-      pluginId: this.info.id
+  /**
+   * 【核心方法 - 不可覆盖】
+   * 注册命令的内部实现，强制执行性能统计和错误捕获
+   * 插件无法覆盖此方法，确保所有统计数据正确收集
+   */
+  [REGISTER_COMMAND_INTERNAL](command, handler, options = {}) {
+    const cmd = command.startsWith('/') ? command.substring(1) : command;
+    
+    const commandInfo = {
+      plugin: this.info.id,
+      command: cmd,
+      description: options.description || `${command} 指令`,
+      usage: options.usage || `/${cmd}`,
+      type: 'custom',
+      category: options.category || 'utility',
+      adminOnly: options.adminOnly || false,
+      executionCount: 0,
+      lastExecuted: null,
+      lastError: null,
+      registeredAt: Date.now()
     };
     
-    this.errors.push(errorInfo);
-    this.statistics.errorsOccurred++;
+    // 【强制包装】确保所有命令执行都被追踪，无法被插件绕过
+    const wrappedHandler = async (event) => {
+      // ========== SDK强制执行：统计数据收集 ==========
+      this.stats.incrementCommandExecutions(cmd, {
+        type: options.type,
+        category: options.category
+      });
+      commandInfo.executionCount++;
+      commandInfo.lastExecuted = Date.now();
+      
+      // ========== SDK强制执行：并发监控 ==========
+      this.stats.incrementConcurrentOperations();
+      
+      const startTime = Date.now();
+      let success = true;
+      let error = null;
+      
+      try {
+        // 执行插件的处理器
+        await handler.call(this, event);
+      } catch (err) {
+        success = false;
+        error = err;
+        
+        // ========== SDK强制执行：错误记录 ==========
+        commandInfo.lastError = {
+          message: err.message,
+          stack: err.stack,
+          timestamp: Date.now()
+        };
+        
+        // 使用内部方法记录错误，确保不被覆盖
+        this[RECORD_ERROR_INTERNAL]('command', cmd, err);
+        
+        // 继续抛出错误，让上层处理
+        throw err;
+      } finally {
+        // ========== SDK强制执行：性能记录（无论成功失败都记录） ==========
+        this.stats.decrementConcurrentOperations();
+        const duration = Date.now() - startTime;
+        this[RECORD_PERFORMANCE_INTERNAL]('command', cmd, duration, success);
+      }
+    };
     
-    // 只保留最近100个错误
-    if (this.errors.length > 100) {
-      this.errors.shift();
-    }
+    commandInfo.handler = wrappedHandler;
+    this.context.commandRegistry?.register(commandInfo);
+    this.registeredCommands.set(cmd, commandInfo);
     
-    this.logger.error(`${type} 错误: ${source}`, { error: error.message });
+    return commandInfo;
+  }
+  
+  /**
+   * 【公开API】注册命令
+   * 内部调用Symbol方法，防止插件覆盖核心逻辑
+   * 插件可以覆盖此方法进行扩展，但核心统计仍会执行
+   */
+  registerCommand(command, handler, options = {}) {
+    // 调用内部实现，确保统计和错误捕获不被绕过
+    return this[REGISTER_COMMAND_INTERNAL](command, handler, options);
+  }
+
+  /**
+   * 【核心方法 - 不可覆盖】
+   * 错误记录的内部实现，委托给统一的统计模块
+   */
+  [RECORD_ERROR_INTERNAL](type, source, error) {
+    this.stats.recordError(type, source, error);
+    
+    // 输出错误日志（确保错误可见）
+    this.logger.error(`[${type}:${source}] ${error?.message || String(error)}`);
+  }
+  
+  /**
+   * 【公开API】记录错误
+   * 插件可以调用，但实际执行通过内部方法
+   */
+  recordError(type, source, error) {
+    return this[RECORD_ERROR_INTERNAL](type, source, error);
   }
 
   // 并发处理
@@ -777,15 +1154,21 @@ export class EnhancedPluginBase extends EventEmitter {
     
     // 包装处理器以记录统计信息
     const wrappedHandler = async (...args) => {
-      this.lastActivity = Date.now();
-      this.statistics.tasksExecuted++;
+      // 使用统计模块
+      this.stats.incrementTasksExecuted(name, { cron });
       taskInfo.executionCount++;
       taskInfo.lastExecuted = Date.now();
+      
+      // 并发监控
+      this.stats.incrementConcurrentOperations();
+      const startTime = Date.now();
+      let success = true;
       
       try {
         const result = await handler(...args);
         return result;
       } catch (error) {
+        success = false;
         taskInfo.lastError = {
           message: error.message,
           stack: error.stack,
@@ -793,6 +1176,10 @@ export class EnhancedPluginBase extends EventEmitter {
         };
         this.recordError('task', name, error);
         throw error;
+      } finally {
+        this.stats.decrementConcurrentOperations();
+        const duration = Date.now() - startTime;
+        this.recordPerformance('task', name, duration, success);
       }
     };
     
@@ -811,6 +1198,12 @@ export class EnhancedPluginBase extends EventEmitter {
   // 生命周期钩子(子类可覆盖)
   async onLoad() {
     this.logger.info(`插件 ${this.info.name} 正在加载...`);
+    
+    // 统计模块已在构造函数中初始化并自动启动保存
+    // 延迟加载统计数据（等待插件完成初始化和注册）
+    setTimeout(() => {
+      this.stats.load();
+    }, 1000);
   }
 
   async onEnable() {
@@ -824,20 +1217,49 @@ export class EnhancedPluginBase extends EventEmitter {
   }
 
   async onUnload() {
+    // 停止性能监控
+    this.stopPerformanceMonitoring();
+    
+    // 【清理全局错误处理器】
+    this._cleanupGlobalErrorHandlers();
+    
+    // 停止统计模块（包括保存和清理）
+    this.stats.destroy();
+    
+    // 清理资源
+    this.eventHandlers.clear();
+    this.commandHandlers.clear();
+    
     this.logger.info(`插件 ${this.info.name} 已卸载`);
   }
 
-  // 获取详细信息
+  /**
+   * 保存统计数据（委托给统计模块）
+   */
+  saveStatistics() {
+    return this.stats.save();
+  }
+
+  /**
+   * 加载统计数据（委托给统计模块）
+   */
+  loadStatistics() {
+    return this.stats.load();
+  }
+
+  // 获取详细信息（使用统一的统计模块）
   getDetailedInfo() {
     const commands = Array.from(this.registeredCommands.values());
     const tasks = Array.from(this.scheduledTasks.values());
-    const recentErrors = this.errors.slice(-10); // 最近10个错误
+    
+    // 从统计模块获取完整数据
+    const statsInfo = this.stats.getDetailedInfo();
     
     return {
       basic: this.info,
       status: {
         isEnabled: this.isEnabled,
-        lastActivity: this.lastActivity
+        lastActivity: statsInfo.statistics.lastActivity
       },
       commands: commands.map(cmd => ({
         command: cmd.command || cmd.name,
@@ -861,14 +1283,90 @@ export class EnhancedPluginBase extends EventEmitter {
         registeredAt: task.registeredAt || Date.now()
       })),
       rules: Array.from(this.usedRules),
-      errors: recentErrors.map(err => ({
-        type: err.type || 'unknown',
-        source: err.source || 'unknown',
-        message: err.message || '',
-        timestamp: err.timestamp || Date.now(),
-        stack: err.stack
-      })),
-      statistics: this.statistics
+      errors: statsInfo.errors,
+      statistics: statsInfo.statistics,
+      performance: statsInfo.performance,
+      asyncSafety: statsInfo.asyncSafety
+    };
+  }
+}
+
+/**
+ * 插件上下文 - 提供给插件的运行环境
+ */
+export class PluginContext {
+  constructor(mainServer) {
+    this.mainServer = mainServer;
+    this.eventBus = mainServer.eventBus;
+    this.commandRegistry = mainServer.commandRegistry;
+    this.messageService = mainServer.messageService;
+    this.apiService = mainServer.apiService;
+    this.notificationService = mainServer.notificationService;
+    this.scheduler = mainServer.scheduler;
+  }
+
+  createLogger(pluginId) {
+    return {
+      info: (msg) => console.log(`[${getLocalTime()}] [Plugin:${pluginId}] ℹ️  ${msg}`),
+      warn: (msg) => console.log(`[${getLocalTime()}] [Plugin:${pluginId}] ⚠️  ${msg}`),
+      error: (msg) => console.log(`[${getLocalTime()}] [Plugin:${pluginId}] ❌ ${msg}`),
+      debug: (msg) => console.log(`[${getLocalTime()}] [Plugin:${pluginId}] 🐛 ${msg}`)
+    };
+  }
+
+  createStorage(pluginId) {
+    const storageDir = path.join(__dirname, '../../data/plugins', pluginId);
+    
+    // 确保存储目录存在
+    if (!fs.existsSync(storageDir)) {
+      fs.mkdirSync(storageDir, { recursive: true });
+    }
+
+    return {
+      get: (key, defaultValue) => {
+        try {
+          const filePath = path.join(storageDir, 'storage.json');
+          if (fs.existsSync(filePath)) {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            return data[key] !== undefined ? data[key] : defaultValue;
+          }
+          return defaultValue;
+        } catch (error) {
+          console.error(`插件 ${pluginId} 读取存储失败:`, error);
+          return defaultValue;
+        }
+      },
+
+      set: (key, value) => {
+        try {
+          const filePath = path.join(storageDir, 'storage.json');
+          let data = {};
+          if (fs.existsSync(filePath)) {
+            data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+          }
+          data[key] = value;
+          fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+          return true;
+        } catch (error) {
+          console.error(`插件 ${pluginId} 写入存储失败:`, error);
+          return false;
+        }
+      },
+
+      delete: (key) => {
+        try {
+          const filePath = path.join(storageDir, 'storage.json');
+          if (fs.existsSync(filePath)) {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            delete data[key];
+            fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+          }
+          return true;
+        } catch (error) {
+          console.error(`插件 ${pluginId} 删除存储失败:`, error);
+          return false;
+        }
+      }
     };
   }
 }

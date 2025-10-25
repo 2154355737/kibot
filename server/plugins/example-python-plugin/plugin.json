@@ -1,0 +1,33 @@
+{
+  "id": "example-python-plugin",
+  "name": "Python示例插件",
+  "version": "1.0.0",
+  "author": "KiBot Team",
+  "description": "演示如何使用Python开发KiBot插件",
+  "language": "python",
+  "runtime": {
+    "python": ">=3.8",
+    "main": "main.py",
+    "requirements": "requirements.txt"
+  },
+  "category": "utility",
+  "main": "main.py",
+  "dependencies": [],
+  "keywords": ["example", "python", "demo"],
+  "license": "MIT",
+  "engines": {
+    "kibot": ">=3.0.0",
+    "node": ">=18.0.0"
+  },
+  "permissions": [
+    "message.send",
+    "event.listen",
+    "storage.read",
+    "storage.write"
+  ],
+  "config": {
+    "enabled": true,
+    "debug": true
+  }
+}
+

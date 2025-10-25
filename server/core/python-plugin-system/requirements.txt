@@ -1,0 +1,8 @@
+# KiBot Python Plugin SDK 依赖
+
+# Python版本要求
+# python>=3.8
+
+# 无额外依赖 - 仅使用Python标准库
+# 这使得SDK轻量且易于部署
+

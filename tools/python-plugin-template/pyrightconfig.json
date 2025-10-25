@@ -1,0 +1,26 @@
+{
+  "include": [
+    "."
+  ],
+  "extraPaths": [
+    "../../core/python-plugin-system"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "../../core/python-plugin-system"
+      ],
+      "pythonVersion": "3.8"
+    }
+  ],
+  "pythonVersion": "3.8",
+  "pythonPlatform": "All",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": false,
+  "reportMissingModuleSource": false,
+  "reportOptionalMemberAccess": false,
+  "reportGeneralTypeIssues": false
+}
+

@@ -48,7 +48,7 @@ class TaskManager {
    */
   setApiCallback(callback) {
     this.apiCallback = callback;
-    logger.success('任务管理器', 'API回调已设置');
+    // 移除日志，避免冗余
   }
 
   /**
@@ -56,7 +56,7 @@ class TaskManager {
    */
   setBroadcastCallback(callback) {
     this.broadcastCallback = callback;
-    logger.success('任务管理器', '广播回调已设置');
+    // 移除日志，避免冗余
   }
 
   /**
@@ -251,8 +251,8 @@ class TaskManager {
       }
     });
     this.runningTasks.clear();
-
-    logger.info('任务管理器', '任务调度器已停止');
+    
+    // 移除日志，由shutdown统一输出
   }
 
   /**
@@ -313,7 +313,7 @@ class TaskManager {
           next.setDate(next.getDate() + 1);
         }
         
-        logger.debug('任务管理器', `简化格式 ${cronExpression} 下次执行: ${next.toLocaleString()}`);
+        logger.debug('任务调度', `${cronExpression} -> ${next.toLocaleString()}`);
         return next;
       }
       
@@ -993,7 +993,7 @@ class TaskManager {
     this.stopScheduler();
     this.saveTasks();
     this.saveTaskHistory();
-    logger.info('任务管理器', '已关闭');
+    logger.success('任务管理器', '已关闭');
   }
 }
 

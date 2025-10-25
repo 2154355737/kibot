@@ -52,7 +52,7 @@ export class OutputManager {
   /**
    * 设置日志级别
    */
-  setLevel(level) {
+  setLevel(level, silent = false) {
     const levels = {
       'quiet': [],
       'error': ['error'],
@@ -63,7 +63,11 @@ export class OutputManager {
     };
     
     this.enabledCategories = new Set(levels[level] || levels.info);
-    console.log(`ℹ️ 设置日志级别: ${level}`);
+    
+    // 只在非静默模式下输出
+    if (!silent) {
+      this.info('日志系统', `级别: ${level}`);
+    }
   }
 
   /**
@@ -83,9 +87,8 @@ export class OutputManager {
       output += ` ${message}`;
     }
     
-    if (data && typeof data === 'object') {
-      output += `\n   详情: ${JSON.stringify(data, null, 2)}`;
-    }
+    // data参数不再展开显示，保持单行格式
+    // 如果需要查看详情，应该在message中包含
     
     return output;
   }
@@ -375,7 +378,16 @@ export class OutputManager {
 // 创建全局实例
 export const logger = new OutputManager();
 
-// 设置默认日志级别
-logger.setLevel(process.env.LOG_LEVEL || 'info');
+// 设置默认日志级别（静默，不输出日志）
+const defaultLevel = process.env.LOG_LEVEL || 'info';
+const levels = {
+  'quiet': [],
+  'error': ['error'],
+  'warn': ['error', 'warning'], 
+  'info': ['error', 'warning', 'success', 'info', 'startup'],
+  'verbose': ['error', 'warning', 'success', 'info', 'startup', 'plugin', 'event'],
+  'debug': ['error', 'warning', 'success', 'info', 'startup', 'plugin', 'event', 'api', 'debug']
+};
+logger.enabledCategories = new Set(levels[defaultLevel] || levels.info);
 
 export default OutputManager;

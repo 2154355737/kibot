@@ -1,5 +1,6 @@
 import SessionManager from './session-manager.js';
 import PermissionController from './permission-controller.js';
+import { logger } from '../utils/output-manager.js';
 
 /**
  * 安全中间件 - 统一的身份验证和权限控制
@@ -10,7 +11,7 @@ export class SecurityMiddleware {
     this.permissionController = new PermissionController();
     this.securityEventHandlers = new Map();
     
-    console.log('🛡️ 安全中间件初始化完成');
+    logger.startup('安全中间件', '初始化完成');
   }
 
   /**
@@ -153,11 +154,7 @@ export class SecurityMiddleware {
   async authenticateUser(authCode, clientInfo = {}) {
     const { clientIp, userAgent } = clientInfo;
     
-    console.log('🔐 用户认证请求:', {
-      clientIp,
-      userAgent: userAgent?.substring(0, 50),
-      authCodeLength: authCode?.length
-    });
+    logger.info('用户认证', `IP: ${clientIp}, UA: ${userAgent?.substring(0, 30)}..., 授权码长度: ${authCode?.length}`);
 
     if (!authCode) {
       this.logSecurityEvent('AUTH_FAILED', {
@@ -281,16 +278,42 @@ export class SecurityMiddleware {
                      eventType.includes('DENIED') || 
                      eventType.includes('INVALID');
     
+    // 格式化关键数据
+    const eventSummary = this.formatEventSummary(eventType, eventData);
+    
     if (isWarning) {
-      console.warn(`🚨 安全事件 [${eventType}]:`, eventData);
+      console.warn(`🚨 安全事件 [${eventType}]: ${eventSummary}`);
     } else {
-      console.log(`🔒 安全事件 [${eventType}]:`, eventData);
+      console.log(`🔒 安全事件 [${eventType}]: ${eventSummary}`);
     }
 
     // 触发安全事件处理器
     this.triggerSecurityEventHandlers(eventType, securityEvent);
   }
 
+  /**
+   * 格式化安全事件摘要（避免展开JSON）
+   */
+  formatEventSummary(eventType, eventData) {
+    const parts = [];
+    
+    if (eventData.sessionId) {
+      parts.push(`会话: ${eventData.sessionId.substring(0, 8)}...`);
+    }
+    if (eventData.permission) {
+      parts.push(`权限: ${eventData.permission}`);
+    }
+    if (eventData.clientIp) {
+      parts.push(`IP: ${eventData.clientIp}`);
+    }
+    if (eventData.userAgent && eventType === 'AUTH_SUCCESS') {
+      const ua = eventData.userAgent.substring(0, 50);
+      parts.push(`UA: ${ua}${eventData.userAgent.length > 50 ? '...' : ''}`);
+    }
+    
+    return parts.length > 0 ? parts.join(', ') : 'N/A';
+  }
+  
   /**
    * 注册安全事件处理器
    * @param {string} eventType - 事件类型
@@ -504,8 +527,6 @@ export class SecurityMiddleware {
    * 关闭安全中间件
    */
   shutdown() {
-    console.log('🛡️ 安全中间件正在关闭...');
-    
     // 清理所有会话
     const sessions = this.sessionManager.getActiveSessions();
     sessions.forEach(session => {
@@ -515,7 +536,7 @@ export class SecurityMiddleware {
     // 清理事件处理器
     this.securityEventHandlers.clear();
     
-    console.log('✅ 安全中间件已关闭');
+    logger.success('安全中间件', '已关闭');
   }
 }
 

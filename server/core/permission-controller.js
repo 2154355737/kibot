@@ -1,3 +1,5 @@
+import { logger } from '../utils/output-manager.js';
+
 /**
  * 权限控制器 - 负责API权限验证和操作审计
  */
@@ -7,7 +9,7 @@ export class PermissionController {
     this.auditLogs = [];
     this.rateLimits = new Map(); // API调用频率限制
     
-    console.log('🛡️ 权限控制器初始化完成');
+    logger.startup('权限控制器', '初始化完成');
   }
 
   /**

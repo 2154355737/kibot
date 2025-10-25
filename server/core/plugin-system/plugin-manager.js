@@ -7,12 +7,102 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
-import { PluginBase, PluginUtils, PluginContext, PluginTypes } from './plugin-sdk.js';
-import { EnhancedPluginBase } from './plugin-sdk-enhanced.js';
+// 注意：PluginBase 已淘汰，改用 EnhancedPluginBase
+import { EnhancedPluginBase, PluginContext } from './plugin-sdk-enhanced.js';
+import { PythonPluginAdapter } from './python-plugin-adapter.js';
 import { logger } from '../../utils/output-manager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * 插件工具类
+ */
+class PluginUtils {
+  /**
+   * 验证插件信息
+   */
+  static validatePluginInfo(pluginInfo) {
+    const required = ['id', 'name', 'version', 'author', 'main'];
+    const missing = required.filter(field => !pluginInfo[field]);
+    
+    if (missing.length > 0) {
+      throw new Error(`插件信息缺少必需字段: ${missing.join(', ')}`);
+    }
+
+    // 验证版本格式
+    if (!/^\d+\.\d+\.\d+$/.test(pluginInfo.version)) {
+      throw new Error('插件版本格式应为 x.y.z');
+    }
+
+    // 验证ID格式
+    if (!/^[a-z0-9_-]+$/i.test(pluginInfo.id)) {
+      throw new Error('插件ID只能包含字母、数字、下划线和连字符');
+    }
+
+    return true;
+  }
+
+  /**
+   * 解析插件依赖
+   */
+  static parseDependencies(dependencies = []) {
+    return dependencies.map(dep => {
+      if (typeof dep === 'string') {
+        return { id: dep, version: '*' };
+      }
+      return dep;
+    });
+  }
+
+  /**
+   * 比较版本号
+   */
+  static compareVersions(version1, version2) {
+    const v1Parts = version1.split('.').map(Number);
+    const v2Parts = version2.split('.').map(Number);
+    
+    for (let i = 0; i < 3; i++) {
+      if (v1Parts[i] > v2Parts[i]) return 1;
+      if (v1Parts[i] < v2Parts[i]) return -1;
+    }
+    return 0;
+  }
+}
+
+/**
+ * 插件类型定义
+ */
+const PluginTypes = {
+  // 插件状态
+  Status: {
+    UNLOADED: 'unloaded',
+    LOADED: 'loaded',
+    ENABLED: 'enabled',
+    DISABLED: 'disabled',
+    ERROR: 'error'
+  },
+
+  // 插件类型
+  Category: {
+    UTILITY: 'utility',
+    ENTERTAINMENT: 'entertainment',
+    ADMIN: 'admin',
+    INTEGRATION: 'integration',
+    OTHER: 'other'
+  },
+
+  // 事件类型
+  Events: {
+    MESSAGE: 'message',
+    GROUP_MESSAGE: 'group_message',
+    PRIVATE_MESSAGE: 'private_message',
+    GROUP_JOIN: 'group_join',
+    GROUP_LEAVE: 'group_leave',
+    FRIEND_ADD: 'friend_add',
+    FRIEND_DELETE: 'friend_delete'
+  }
+};
 
 export class PluginManager extends EventEmitter {
   constructor(mainServer) {
@@ -67,7 +157,7 @@ export class PluginManager extends EventEmitter {
           }
         }
       });
-      console.log('👀 已启用插件热重载监听');
+      logger.info('插件系统', '已启用热重载监听');
     }
   }
 
@@ -105,11 +195,10 @@ export class PluginManager extends EventEmitter {
    * 扫描插件目录
    */
   async scanPlugins() {
-    console.log('🔍 扫描插件目录...');
     const plugins = [];
 
     if (!fs.existsSync(this.pluginDir)) {
-      console.log('📁 插件目录不存在，跳过扫描');
+      console.log('📁 插件目录不存在');
       return plugins;
     }
 
@@ -133,15 +222,19 @@ export class PluginManager extends EventEmitter {
             plugins.push(pluginInfo);
             this.pluginInfos.set(pluginInfo.id, pluginInfo);
             
-            console.log(`📦 发现插件: ${pluginInfo.name} (${pluginInfo.version})`);
+            // 只显示启用的插件
+            if (pluginInfo.enabled) {
+              logger.plugin('发现插件', `${pluginInfo.name} (${pluginInfo.version})`);
+            }
           } catch (error) {
-            console.error(`❌ 解析插件信息失败 ${item}:`, error.message);
+            console.error(`❌ 解析插件失败 ${item}:`, error.message);
           }
         }
       }
     }
 
-    console.log(`✅ 扫描完成，发现 ${plugins.length} 个插件`);
+    const enabledCount = plugins.filter(p => p.enabled).length;
+    logger.success('插件扫描', `发现 ${plugins.length} 个 (${enabledCount} 个已启用)`);
     return plugins;
   }
 
@@ -160,56 +253,64 @@ export class PluginManager extends EventEmitter {
         return this.plugins.get(pluginId);
       }
 
-      console.log(`🔄 加载插件: ${pluginInfo.name}`);
-      console.log(`📁 插件路径: ${pluginInfo.path}`);
-      console.log(`📄 插件主文件: ${pluginInfo.main || 'index.js'}`);
+      const langIcon = pluginInfo.language === 'python' ? '🐍' : '📦';
+      logger.plugin('插件加载', `${langIcon} ${pluginInfo.name}`);
 
       // 检查依赖
       await this.checkDependencies(pluginInfo);
 
-      // 动态导入插件模块
-      const mainFile = path.join(pluginInfo.path, pluginInfo.main || 'index.js');
-      console.log(`🎯 完整主文件路径: ${mainFile}`);
-      
-      if (!fs.existsSync(mainFile)) {
-        throw new Error(`插件主文件不存在: ${pluginInfo.main}`);
+      let pluginInstance;
+
+      // 检查插件语言类型
+      if (pluginInfo.language === 'python') {
+        // 加载Python插件
+        pluginInstance = new PythonPluginAdapter(pluginInfo, this.context);
+        await pluginInstance.start();
+      } else {
+        // 加载JavaScript插件（原有逻辑）
+        const mainFile = path.join(pluginInfo.path, pluginInfo.main || 'index.js');
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('插件路径', mainFile);
+        }
+        
+        if (!fs.existsSync(mainFile)) {
+          throw new Error(`插件主文件不存在: ${pluginInfo.main}`);
+        }
+
+        // 清理模块缓存（用于热重载）
+        // 确保使用正确的文件URL格式
+        const absolutePath = path.resolve(mainFile);
+        const moduleUrl = `file://${absolutePath.replace(/\\/g, '/')}?t=${Date.now()}`;
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('插件导入', moduleUrl);
+        }
+        
+        const module = await import(moduleUrl);
+        
+        if (!module.default) {
+          throw new Error('插件必须导出默认类');
+        }
+
+        // 实例化插件
+        const PluginClass = module.default;
+        pluginInstance = new PluginClass(pluginInfo, this.context);
+
+        // 验证插件实例 - 只支持 EnhancedPluginBase
+        const isValidPlugin = pluginInstance instanceof EnhancedPluginBase;
+        
+        if (!isValidPlugin) {
+          throw new Error('插件必须继承自 EnhancedPluginBase');
+        }
+        
+        // 调用插件加载钩子
+        await pluginInstance.onLoad();
       }
-
-      // 清理模块缓存（用于热重载）
-      // 确保使用正确的文件URL格式
-      const absolutePath = path.resolve(mainFile);
-      const moduleUrl = `file://${absolutePath.replace(/\\/g, '/')}?t=${Date.now()}`;
-      console.log(`🔗 尝试导入模块: ${moduleUrl}`);
-      
-      const module = await import(moduleUrl);
-      
-      if (!module.default) {
-        throw new Error('插件必须导出默认类');
-      }
-
-      // 实例化插件
-      const PluginClass = module.default;
-      const pluginInstance = new PluginClass(pluginInfo, this.context);
-
-      // 验证插件实例 - 支持 PluginBase 和 EnhancedPluginBase
-      const isValidPlugin = pluginInstance instanceof PluginBase || 
-                           pluginInstance instanceof EnhancedPluginBase;
-      
-      if (!isValidPlugin) {
-        throw new Error('插件必须继承自 PluginBase 或 EnhancedPluginBase');
-      }
-      
-      console.log(`✅ 插件类型验证通过: ${pluginInstance.constructor.name}`);
-
-      // 调用插件加载钩子
-      await pluginInstance.onLoad();
 
       // 注册插件
       this.plugins.set(pluginId, pluginInstance);
       this.updatePluginStatus(pluginId, PluginTypes.Status.LOADED);
 
-      console.log(`✅ 插件加载成功: ${pluginInfo.name}`);
-      console.log(`📊 当前已加载插件数量: ${this.plugins.size}`);
+      // 移除中间状态日志，由initialize统一显示
       this.emit('pluginLoaded', pluginId);
 
       return pluginInstance;
@@ -238,8 +339,6 @@ export class PluginManager extends EventEmitter {
         return;
       }
 
-      console.log(`🚀 启用插件: ${plugin.info.name}`);
-
       // 调用插件启用钩子
       await plugin.onEnable();
 
@@ -247,8 +346,9 @@ export class PluginManager extends EventEmitter {
       this.updatePluginStatus(pluginId, PluginTypes.Status.ENABLED);
       this.setPluginConfig(pluginId, 'enabled', true);
 
-      console.log(`✅ 插件启用成功: ${plugin.info.name}`);
-      console.log(`📊 当前已启用插件数量: ${Array.from(this.plugins.values()).filter(p => p.isEnabled).length}`);
+      logger.success('插件启用', plugin.info.name);
+      
+      // 移除中间状态日志，由initialize统一显示
       this.emit('pluginEnabled', pluginId);
     } catch (error) {
       console.error(`❌ 插件启用失败 ${pluginId}:`, error);
@@ -260,8 +360,9 @@ export class PluginManager extends EventEmitter {
 
   /**
    * 禁用插件
+   * @param {boolean} silent - 是否静默禁用（用于关闭流程）
    */
-  async disablePlugin(pluginId) {
+  async disablePlugin(pluginId, silent = false) {
     try {
       const plugin = this.plugins.get(pluginId);
       if (!plugin) {
@@ -269,11 +370,8 @@ export class PluginManager extends EventEmitter {
       }
 
       if (!plugin.isEnabled) {
-        console.log(`⚠️ 插件已禁用: ${pluginId}`);
         return;
       }
-
-      console.log(`⏸️ 禁用插件: ${plugin.info.name}`);
 
       // 调用插件禁用钩子
       await plugin.onDisable();
@@ -282,10 +380,12 @@ export class PluginManager extends EventEmitter {
       this.updatePluginStatus(pluginId, PluginTypes.Status.DISABLED);
       this.setPluginConfig(pluginId, 'enabled', false);
 
-      console.log(`✅ 插件禁用成功: ${plugin.info.name}`);
+      if (!silent) {
+        logger.success('插件禁用', plugin.info.name);
+      }
       this.emit('pluginDisabled', pluginId);
     } catch (error) {
-      console.error(`❌ 插件禁用失败 ${pluginId}:`, error);
+      logger.error('插件禁用', `${pluginId}: ${error.message}`);
       this.emit('pluginError', pluginId, error);
       throw error;
     }
@@ -293,35 +393,36 @@ export class PluginManager extends EventEmitter {
 
   /**
    * 卸载插件
+   * @param {boolean} silent - 是否静默卸载（不输出日志）
    */
-  async unloadPlugin(pluginId) {
+  async unloadPlugin(pluginId, silent = false) {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      return;
+    }
+
     try {
-      const plugin = this.plugins.get(pluginId);
-      if (!plugin) {
-        console.log(`⚠️ 插件未加载: ${pluginId}`);
-        return;
-      }
-
-      console.log(`📤 卸载插件: ${plugin.info.name}`);
-
-      // 先禁用插件
+      // 先禁用插件（静默）
       if (plugin.isEnabled) {
-        await this.disablePlugin(pluginId);
+        await this.disablePlugin(pluginId, true); // 传入silent标志
       }
 
       // 调用插件卸载钩子
       await plugin.onUnload();
 
-      // 清理资源
+      if (!silent) {
+        logger.success('插件卸载', plugin.info.name);
+      }
+    } catch (error) {
+      // 即使卸载失败也要清理资源，且只在非静默模式输出错误
+      if (!silent) {
+        logger.error('插件卸载', `${pluginId}: ${error.message}`);
+      }
+    } finally {
+      // 确保资源被清理（即使出错也执行）
       this.plugins.delete(pluginId);
       this.updatePluginStatus(pluginId, PluginTypes.Status.UNLOADED);
-
-      console.log(`✅ 插件卸载成功: ${plugin.info.name}`);
       this.emit('pluginUnloaded', pluginId);
-    } catch (error) {
-      console.error(`❌ 插件卸载失败 ${pluginId}:`, error);
-      this.emit('pluginError', pluginId, error);
-      throw error;
     }
   }
 
@@ -474,6 +575,127 @@ export class PluginManager extends EventEmitter {
   }
 
   /**
+   * 获取所有插件的性能数据
+   */
+  getAllPluginsPerformance() {
+    const performanceData = [];
+    
+    for (const [id, plugin] of this.plugins) {
+      const info = this.pluginInfos.get(id);
+      if (!info) continue;
+      
+      const detailedInfo = plugin.getDetailedInfo();
+      
+      performanceData.push({
+        pluginId: id,
+        pluginName: info.name,
+        language: info.language || 'javascript',
+        isEnabled: plugin.isEnabled,
+        statistics: detailedInfo.statistics,
+        performance: detailedInfo.performance || {},
+        errors: detailedInfo.errors || [],
+        processMonitor: detailedInfo.processMonitor || null,
+        threadSafety: detailedInfo.threadSafety || null,
+        asyncSafety: detailedInfo.asyncSafety || null,
+        lastActivity: detailedInfo.status.lastActivity
+      });
+    }
+    
+    return performanceData;
+  }
+
+  /**
+   * 获取单个插件的性能数据
+   */
+  getPluginPerformance(pluginId) {
+    const plugin = this.plugins.get(pluginId);
+    const info = this.pluginInfos.get(pluginId);
+    
+    if (!plugin || !info) return null;
+    
+    const detailedInfo = plugin.getDetailedInfo();
+    
+    return {
+      pluginId,
+      pluginName: info.name,
+      language: info.language || 'javascript',
+      isEnabled: plugin.isEnabled,
+      statistics: detailedInfo.statistics,
+      performance: detailedInfo.performance || {},
+      errors: detailedInfo.errors || [],
+      processMonitor: detailedInfo.processMonitor || null,
+      threadSafety: detailedInfo.threadSafety || null,
+      asyncSafety: detailedInfo.asyncSafety || null,
+      status: detailedInfo.status,
+      commands: detailedInfo.commands,
+      tasks: detailedInfo.tasks
+    };
+  }
+
+  /**
+   * 清理所有插件的性能数据
+   */
+  clearAllPluginsPerformance() {
+    let clearedCount = 0;
+    
+    for (const [id, plugin] of this.plugins) {
+      try {
+        // 如果插件有 stats 属性（PluginStatistics 实例），调用 reset 方法
+        if (plugin.stats && typeof plugin.stats.reset === 'function') {
+          plugin.stats.reset();
+          clearedCount++;
+        }
+      } catch (error) {
+        console.error(`❌ 清理插件 ${id} 性能数据失败:`, error);
+      }
+    }
+    
+    console.log(`🧹 已清理 ${clearedCount} 个插件的性能数据`);
+    
+    return {
+      success: true,
+      message: `已清理 ${clearedCount} 个插件的性能数据`,
+      clearedCount
+    };
+  }
+
+  /**
+   * 清理单个插件的性能数据
+   */
+  clearPluginPerformance(pluginId) {
+    const plugin = this.plugins.get(pluginId);
+    
+    if (!plugin) {
+      return {
+        success: false,
+        message: '插件不存在'
+      };
+    }
+    
+    try {
+      if (plugin.stats && typeof plugin.stats.reset === 'function') {
+        plugin.stats.reset();
+        console.log(`🧹 已清理插件 ${pluginId} 的性能数据`);
+        return {
+          success: true,
+          message: '插件性能数据已清理'
+        };
+      } else {
+        return {
+          success: false,
+          message: '插件不支持性能数据清理'
+        };
+      }
+    } catch (error) {
+      console.error(`❌ 清理插件 ${pluginId} 性能数据失败:`, error);
+      return {
+        success: false,
+        message: `清理失败: ${error.message}`
+      };
+    }
+  }
+
+  /**
    * 更新插件状态
    */
   updatePluginStatus(pluginId, status, error = null) {
@@ -542,8 +764,6 @@ export class PluginManager extends EventEmitter {
         for (const [pluginId, config] of Object.entries(configs)) {
           this.pluginConfigs.set(pluginId, config);
         }
-        
-        console.log('✅ 插件配置加载完成');
       }
     } catch (error) {
       console.error('❌ 加载插件配置失败:', error);
@@ -554,7 +774,7 @@ export class PluginManager extends EventEmitter {
    * 初始化插件系统
    */
   async initialize() {
-    console.log('🚀 初始化插件系统...');
+    logger.startup('插件系统', '正在扫描...');
     
     // 加载配置
     this.loadPluginConfigs();
@@ -563,46 +783,63 @@ export class PluginManager extends EventEmitter {
     const plugins = await this.scanPlugins();
     
     // 自动加载和启用已启用的插件
-    for (const pluginInfo of plugins) {
-      console.log(`🔍 检查插件: ${pluginInfo.id}, 启用状态: ${pluginInfo.enabled}`);
-      if (pluginInfo.enabled) {
+    const enabledPlugins = plugins.filter(p => p.enabled);
+    if (enabledPlugins.length > 0) {
+      logger.startup('插件系统', '正在加载...');
+      for (const pluginInfo of enabledPlugins) {
         try {
-          console.log(`🔄 开始加载插件: ${pluginInfo.id}`);
           await this.loadPlugin(pluginInfo.id);
-          console.log(`🔄 开始启用插件: ${pluginInfo.id}`);
           await this.enablePlugin(pluginInfo.id);
-          console.log(`✅ 插件 ${pluginInfo.id} 加载并启用成功`);
         } catch (error) {
-          console.error(`❌ 自动启用插件失败 ${pluginInfo.id}:`, error);
-          console.error(`❌ 错误堆栈:`, error.stack);
+          logger.error('插件启用', `${pluginInfo.name} - ${error.message}`);
+          if (process.env.LOG_LEVEL === 'debug') {
+            console.error('   堆栈:', error.stack);
+          }
         }
       }
     }
     
-    console.log('✅ 插件系统初始化完成');
-    console.log(`📊 最终状态 - 总插件数: ${this.pluginInfos.size}, 已加载: ${this.plugins.size}, 已启用: ${Array.from(this.plugins.values()).filter(p => p.isEnabled).length}`);
+    const enabledCount = Array.from(this.plugins.values()).filter(p => p.isEnabled).length;
+    const disabledCount = this.pluginInfos.size - enabledCount;
+    
+    logger.success('插件系统', `总计 ${this.pluginInfos.size} 个 | 已启用 ${enabledCount} | 未启用 ${disabledCount}`);
   }
 
   /**
    * 关闭插件系统
    */
   async shutdown() {
-    console.log('⏹️ 关闭插件系统...');
-    
-    // 禁用所有插件
-    for (const pluginId of this.plugins.keys()) {
-      try {
-        await this.unloadPlugin(pluginId);
-      } catch (error) {
-        console.error(`❌ 卸载插件失败 ${pluginId}:`, error);
-      }
+    const pluginCount = this.plugins.size;
+    if (pluginCount === 0) {
+      return;
     }
+    
+    // 并发卸载所有插件，但有超时保护
+    const unloadPromises = Array.from(this.plugins.keys()).map(async (pluginId) => {
+      try {
+        // 为每个插件设置独立的超时（2秒足够）
+        await Promise.race([
+          this.unloadPlugin(pluginId, true), // 静默卸载
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('卸载超时')), 2000)
+          )
+        ]);
+      } catch (error) {
+        // 静默处理所有错误（包括超时）
+      }
+    });
+    
+    // 等待所有插件卸载完成或超时
+    await Promise.allSettled(unloadPromises);
     
     // 保存配置
     this.savePluginConfigs();
     
-    console.log('✅ 插件系统已关闭');
+    logger.success('插件系统', '已关闭');
   }
 }
+
+// 导出工具类和类型定义
+export { PluginUtils, PluginTypes };
 
 export default PluginManager;

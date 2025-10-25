@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { logger } from '../utils/output-manager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,7 +22,7 @@ export class SessionManager {
     // 定期清理过期会话
     this.startSessionCleanup();
     
-    console.log('🔐 会话管理器初始化完成');
+    logger.startup('会话管理器', '初始化完成');
   }
 
   /**
@@ -34,7 +35,7 @@ export class SessionManager {
       
       if (fs.existsSync(securityPath)) {
         const config = JSON.parse(fs.readFileSync(securityPath, 'utf8'));
-        console.log('📋 已加载安全配置文件:', securityPath);
+        logger.info('安全配置', securityPath);
         return config;
       }
       
@@ -162,7 +163,7 @@ export class SessionManager {
 
     this.sessions.set(sessionId, session);
     
-    console.log(`✅ 会话创建成功: ${sessionId} (权限: ${permission}, IP: ${clientIp})`);
+    logger.success('会话创建', `${sessionId.substring(0, 8)}... (${permission}, ${clientIp})`);
     
     return {
       success: true,

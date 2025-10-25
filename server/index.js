@@ -4,19 +4,29 @@ import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { createRequire } from 'module';
 import EventResponseEngine from './core/event-engine.js';
 import UserApiService from './core/user-api.js';
 import PluginManager from './core/plugin-system/plugin-manager.js';
 import SecurityMiddleware from './core/security-middleware.js';
 import TaskManager from './core/task-manager.js';
 import { logger } from './utils/output-manager.js';
-import { monitorDataManager } from './utils/monitor-data-manager.js';
 import { needsInitialization, runInteractiveInitialization } from './init-helper.js';
 import { getTimezoneInfo } from './utils/timezone-helper.js';
 import './core/types.js';
 import { updaterService } from './core/updater-service.js';
+import { systemStatistics } from './core/system-statistics.js';
+
+// 读取package.json获取版本号
+const require = createRequire(import.meta.url);
+const packageJson = require('./package.json');
+const SERVER_VERSION = packageJson.version;
+
+// 将 systemStatistics 设置为全局可访问（供事件引擎等模块使用）
+global.systemStatistics = systemStatistics;
 
 // ES模块中获取__dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -129,28 +139,39 @@ const CONFIG = {
 
 class KiBotWebSocketServer {
   constructor() {
+    this.startTime = Date.now(); // 记录启动时间
     this.wss = null;
     this.clients = new Map(); // 存储客户端连接
     this.llonebotWs = null; // LLOneBot反向WebSocket连接
     this.pendingRequests = new Map(); // 存储待处理的API请求
     this.heartbeatInterval = null;
+    this.isInitialized = false; // 初始化完成标志
+    this.recentAuthFailures = new Map(); // 记录最近的认证失败（用于去重）
+    
+    // 使用统一的系统统计模块
+    this.systemStats = systemStatistics;
     
     // 显示启动横幅
-    logger.banner();
+    console.log('\n╔════════════════════════════════════════════════════════╗');
+    console.log(`║           🎉 KiBot v${SERVER_VERSION} 启动中...                  ║`);
+    console.log('╚════════════════════════════════════════════════════════╝\n');
     
-    // 设置日志级别（减少冗余输出）
-    logger.setLevel(process.env.LOG_LEVEL || 'info');
+    // 设置日志级别（静默，不输出日志）
+    logger.setLevel(process.env.LOG_LEVEL || 'info', true);
     
     // 启动时清理旧日志文件
     logger.cleanupOldLogs();
     
+    // 输出系统统计状态
+    logger.info('系统统计', '系统统计模块已初始化');
+    
     // 初始化后端服务
-    logger.startup('后端服务', '初始化事件处理引擎...');
+    logger.startup('事件引擎', '初始化中...');
     this.eventEngine = new EventResponseEngine();
     this.userApiService = new UserApiService(null); // WebSocket连接稍后设置
     
     // 初始化安全中间件
-    logger.startup('安全系统', '初始化安全中间件...');
+    logger.startup('安全系统', '初始化中...');
     this.securityMiddleware = new SecurityMiddleware();
     
     // 初始化插件管理器  
@@ -236,7 +257,9 @@ class KiBotWebSocketServer {
       tasks: new Map(),
       create: (name, cron, handler) => {
         // 简单的定时任务实现（生产环境建议使用node-cron）
-        console.log(`⏰ 创建定时任务: ${name} (${cron})`);
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('定时任务', `${name} (${cron})`);
+        }
         // 这里可以集成node-cron或其他定时任务库
         return { name, cron, handler };
       }
@@ -245,11 +268,11 @@ class KiBotWebSocketServer {
     this.pluginManager = new PluginManager(this);
     
     // 初始化任务管理器
-    logger.startup('任务管理器', '正在初始化...');
+    logger.startup('任务管理器', '初始化中...');
     this.taskManager = new TaskManager(this);
     
     // 初始化更新器服务
-    logger.startup('更新系统', '初始化更新器服务...');
+    logger.startup('更新系统', '初始化中...');
     try {
       // 确保更新器目录存在
       const updatesDir = path.join(__dirname, '.updates');
@@ -260,22 +283,26 @@ class KiBotWebSocketServer {
       // 检查更新器脚本
       const updaterScript = path.join(__dirname, 'update-backend.js');
       if (fs.existsSync(updaterScript)) {
-        logger.success('更新系统', '更新器就绪 (运行 npm run update 可更新后端)');
+        logger.success('更新系统', '就绪');
       } else {
-        logger.warning('更新系统', '更新器脚本未找到');
+        logger.warning('更新系统', '脚本未找到');
       }
       
-      // 检查备份数量
+      // 检查备份数量（仅在有备份时显示）
       const backupDir = path.join(updatesDir, 'backups');
       if (fs.existsSync(backupDir)) {
         const backups = fs.readdirSync(backupDir).filter(f => f.startsWith('server-backup-'));
         if (backups.length > 0) {
-          logger.info('更新系统', `发现 ${backups.length} 个历史备份`);
+          logger.info('更新系统', `历史备份: ${backups.length} 个`);
         }
       }
     } catch (error) {
-      logger.warning('更新系统', '初始化警告: ' + error.message);
+      logger.warning('更新系统', error.message);
     }
+    
+    // 初始化规则分组
+    this.groups = [];
+    this.loadGroups();
     
     // 设置任务管理器的API回调
     this.taskManager.setApiCallback((action, params) => {
@@ -292,10 +319,6 @@ class KiBotWebSocketServer {
     
     // 设置事件引擎回调
     this.setupEventEngineCallbacks();
-    
-    // 初始化分组
-    this.groups = [];
-    this.loadGroups();
 
     logger.success('后端服务', '初始化完成');
   }
@@ -321,9 +344,9 @@ class KiBotWebSocketServer {
               type: 'reply',
               data: { id: options.replyTo.toString() }
             });
-            console.log(`💬 后端自动回复消息 (${type}): ${message} [回复消息ID: ${options.replyTo}]`);
+            logger.info('自动回复', `(${type}) ${message.substring(0, 30)}... [回复ID: ${options.replyTo}]`);
           } else {
-            console.log(`🤖 后端自动发送消息 (${type}): ${message}`);
+            logger.info('自动发送', `(${type}) ${message.substring(0, 30)}...`);
           }
           
           // 添加文本消息段
@@ -337,7 +360,7 @@ class KiBotWebSocketServer {
         
         // 确保WebSocket连接可用
         if (!this.llonebotWs || this.llonebotWs.readyState !== 1) {
-          console.error('❌ WebSocket未连接，无法发送消息');
+          logger.error('消息发送', 'WebSocket未连接');
           return;
         }
         
@@ -347,9 +370,9 @@ class KiBotWebSocketServer {
           message: messageContent
         });
         
-        console.log(`✅ 消息发送成功 (${type})`);
+        logger.success('消息发送', `${type} 成功`);
       } catch (error) {
-        console.error('后端发送消息失败:', error);
+        logger.error('消息发送', error.message);
       }
     });
 
@@ -364,23 +387,23 @@ class KiBotWebSocketServer {
 
     // 设置API调用回调
     this.eventEngine.setCallApiCallback(async (action, params) => {
-      console.log(`🔧 事件引擎API调用: ${action}`, params);
+      // 只在debug模式下记录
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('事件引擎API', `${action}: ${JSON.stringify(params)}`);
+      }
       
       // 检查是否是规则管理API
       if (action.startsWith('rules_')) {
-        console.log(`📋 事件引擎调用规则API: ${action}`);
         return await this.handleRulesApi(action, params);
       }
       
       // 检查是否是分组管理API
       if (action.startsWith('groups_')) {
-        console.log(`📂 事件引擎调用分组API: ${action}`);
         return await this.handleRulesApi(action, params);
       }
 
       // 检查是否是后端内部API (现在主要是internal_开头的API)
       if (action.startsWith('internal_')) {
-        console.log(`🔧 事件引擎调用后端内部API: ${action}`);
         return await this.handleRulesApi(action, params);
       }
       
@@ -388,7 +411,7 @@ class KiBotWebSocketServer {
       if (!this.llonebotWs || this.llonebotWs.readyState !== 1) {
         throw new Error('WebSocket未连接，无法调用LLOneBot API');
       }
-      console.log(`📡 事件引擎调用LLOneBot API: ${action}`);
+      logger.debug('事件引擎', `调用API: ${action}`);
       return await this.callLLOneBotViaWebSocket(action, params);
     });
 
@@ -456,7 +479,7 @@ class KiBotWebSocketServer {
                          req.headers['authorization']?.replace('Bearer ', '');
         
         if (!sessionId) {
-          console.warn('🚫 HTTP API未授权访问:', action);
+          logger.warning('未授权访问', action);
           const errorResponse = {
             status: 'error',
             retcode: -1,
@@ -482,11 +505,25 @@ class KiBotWebSocketServer {
         );
         
         if (!validationResult.success) {
-          console.warn('🚫 HTTP API权限验证失败:', {
-            action,
-            error: validationResult.error,
-            sessionId: sessionId.substring(0, 8) + '...'
-          });
+          // 去重：相同的错误在30秒内只记录一次
+          const errorKey = `${sessionId}-${action}-${validationResult.error}`;
+          const now = Date.now();
+          const lastLog = this.recentAuthFailures.get(errorKey);
+          
+          if (!lastLog || (now - lastLog) > 30000) {
+            this.recentAuthFailures.set(errorKey, now);
+            logger.warning('权限验证', `${action} - ${validationResult.error} (会话: ${sessionId.substring(0, 8)}...)`);
+            
+            // 定期清理旧记录
+            if (this.recentAuthFailures.size > 100) {
+              const cutoff = now - 60000; // 1分钟前
+              for (const [key, time] of this.recentAuthFailures.entries()) {
+                if (time < cutoff) {
+                  this.recentAuthFailures.delete(key);
+                }
+              }
+            }
+          }
           
           const errorResponse = {
             status: 'error',
@@ -508,8 +545,11 @@ class KiBotWebSocketServer {
       }
       
       // 调用对应的API处理方法（复用现有的WebSocket API逻辑）
+      const startTime = Date.now();
       let response;
+      let success = true;
       
+      try {
       // 规则管理API
       if (action.startsWith('rules_')) {
         response = await this.handleRulesApi(action, params);
@@ -519,7 +559,11 @@ class KiBotWebSocketServer {
         response = await this.handleRulesApi(action, params);
       }
       // 插件管理API
-      else if (action.startsWith('plugins_')) {
+      else if (action.startsWith('plugins_') || action === 'plugin_performance') {
+        response = await this.handleRulesApi(action, params);
+      }
+      // 系统性能API
+      else if (action === 'system_performance' || action === 'clear_api_stats' || action === 'clear_plugins_performance') {
         response = await this.handleRulesApi(action, params);
       }
       // 聊天相关API
@@ -550,7 +594,9 @@ class KiBotWebSocketServer {
                action === 'set_system_config' || action === 'reset_system_config' || 
                action === 'restart_service' || action === 'internal_security_stats' ||
                action === 'generate_auth_code' || action === 'reload_security_config' ||
-               action === 'get_changelog') {
+               action === 'get_changelog' || action === 'get_system_settings' ||
+               action === 'update_system_settings' || action === 'get_disk_usage' ||
+               action === 'get_data_stats' || action === 'cleanup_data' || action === 'archive_old_data') {
         response = await this.handleSystemApi(action, params);
       }
       // 更新器API
@@ -563,6 +609,15 @@ class KiBotWebSocketServer {
           throw new Error('与QQ Bot的WebSocket连接未建立');
         }
         response = await this.callLLOneBotViaWebSocket(action, params);
+      }
+      
+      } catch (apiError) {
+        success = false;
+        throw apiError;
+      } finally {
+        // 记录HTTP请求性能
+        const responseTime = Date.now() - startTime;
+        this.recordHttpRequest(action, responseTime, success);
       }
       
       // 发送HTTP响应
@@ -582,13 +637,14 @@ class KiBotWebSocketServer {
                        response.status === 'error' || 
                        response.retcode !== 0;
       
-      if (shouldLog) {
+      // 只在debug模式下记录HTTP API响应
+      if (shouldLog && process.env.LOG_LEVEL === 'debug') {
         const statusEmoji = response.status === 'ok' || response.retcode === 0 ? '✅' : '❌';
-        console.log(`${statusEmoji} HTTP API: ${action} -> ${response.status || (response.retcode === 0 ? 'ok' : 'failed')} (${httpStatus})`);
+        logger.debug('HTTP API', `${action} -> ${response.status || (response.retcode === 0 ? 'ok' : 'failed')} (${httpStatus})`);
       }
       
     } catch (error) {
-      console.error(`❌ HTTP API处理失败: ${action}`, error);
+      logger.error('HTTP API', `${action} 处理失败: ${error.message}`);
       
       const errorResponse = {
         status: 'error',
@@ -630,8 +686,8 @@ class KiBotWebSocketServer {
       );
 
       if (authResult.success) {
-        // 认证成功，返回会话信息
-        console.log(`✅ HTTP 认证成功: ${authResult.permission} (会话ID: ${authResult.sessionId.substring(0, 8)}...)`);
+        // 认证成功，返回会话信息（已有其他日志，此处不再重复输出）
+        // logger.success('HTTP认证', `${authResult.permission} (会话: ${authResult.sessionId.substring(0, 8)}...)`);
         
         return {
           status: 'ok',
@@ -648,7 +704,7 @@ class KiBotWebSocketServer {
         };
       } else {
         // 认证失败
-        console.warn(`❌ HTTP 认证失败: ${authResult.error} - ${authResult.message}`);
+        logger.warning('HTTP认证', `${authResult.error} - ${authResult.message}`);
         
         return {
           status: 'error',
@@ -662,7 +718,7 @@ class KiBotWebSocketServer {
       }
 
     } catch (error) {
-      console.error('❌ 认证API处理失败:', error);
+      logger.error('认证API', error.message);
       return {
         status: 'error',
         retcode: -1,
@@ -695,8 +751,9 @@ class KiBotWebSocketServer {
       const method = req.method;
       
       // 只记录非GET请求和特殊端点，减少日志噪音
-      if (method !== 'GET' && !url.startsWith('/api/logs_') && !url.startsWith('/api/monitor_')) {
-        console.log(`🌐 HTTP请求: ${method} ${url} from ${req.socket.remoteAddress}`);
+      // 只在debug模式下记录HTTP请求（减少日志噪音）
+      if (process.env.LOG_LEVEL === 'debug' && method !== 'GET' && !url.startsWith('/api/logs_') && !url.startsWith('/api/monitor_')) {
+        logger.debug('HTTP请求', `${method} ${url} (${req.socket.remoteAddress})`);
       }
       
       // 健康检查端点
@@ -715,7 +772,7 @@ class KiBotWebSocketServer {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
           name: 'KiBot Server',
-          version: '1.0.0',
+          version: SERVER_VERSION,
           status: 'running',
           clients: this.clients.size,
           websocket: this.llonebotWs?.readyState === 1,
@@ -750,28 +807,29 @@ class KiBotWebSocketServer {
       clientTracking: true,
       // 处理升级错误
       handleProtocols: (protocols) => {
-        console.log('🔗 WebSocket协议:', protocols);
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('WebSocket', `协议: ${protocols.join(', ')}`);
+        }
         return protocols.length > 0 ? protocols[0] : false;
       }
     });
 
     // HTTP服务器监听端口
     this.server.listen(CONFIG.WS_PORT, '0.0.0.0', () => {
-      // 显示时区信息
       const tzInfo = getTimezoneInfo();
-      console.log(`🚀 KiBot服务器启动在端口 ${CONFIG.WS_PORT}`);
-      console.log(`🌐 HTTP API: http://localhost:${CONFIG.WS_PORT}/api/*`);
-      console.log(`📡 WebSocket事件: ws://localhost:${CONFIG.WS_PORT} (仅用于事件推送)`);
-      console.log(`🔍 健康检查: http://localhost:${CONFIG.WS_PORT}/health`);
-      console.log(`🕐 服务器时区: ${tzInfo.timezone} (${tzInfo.offsetString})`);
-      console.log(`📅 本地时间: ${tzInfo.localTime}`);
+      logger.success('服务器启动成功', `端口 ${CONFIG.WS_PORT}`);
+      logger.info('版本信息', `v${SERVER_VERSION}`);
+      logger.info('HTTP API', `http://localhost:${CONFIG.WS_PORT}/api/*`);
+      logger.info('WebSocket', `ws://localhost:${CONFIG.WS_PORT}`);
+      logger.info('时区', `${tzInfo.timezone} (${tzInfo.offsetString})`);
     });
 
-    // 处理HTTP升级错误
-    this.server.on('upgrade', (request, socket, head) => {
-      console.log(`🔄 WebSocket升级请求: ${request.url} from ${socket.remoteAddress}`);
-      console.log(`📝 Headers:`, request.headers);
-    });
+    // 处理HTTP升级错误（调试模式下才显示）
+    if (process.env.LOG_LEVEL === 'debug') {
+      this.server.on('upgrade', (request, socket, head) => {
+        logger.debug('WebSocket升级', `${request.url} from ${socket.remoteAddress}`);
+      });
+    }
 
     // WebSocket连接处理
     this.wss.on('connection', (ws, req) => {
@@ -781,81 +839,188 @@ class KiBotWebSocketServer {
       const url = req.url || '/';
       const origin = req.headers['origin'] || '';
       
-      console.log(`🔗 WebSocket连接请求:`);
-      console.log(`   地址: ${remoteAddress}`);
-      console.log(`   路径: ${url}`);
-      console.log(`   来源: ${origin}`);
-      console.log(`   User-Agent: ${userAgent}`);
-      
       // 识别客户端类型
       const clientType = this.identifyClientType(req);
       
-      console.log(`🔍 客户端类型识别: ${clientType.type}`);
-      console.log(`   信任度: ${clientType.trusted ? '可信' : '不可信'}`);
-      console.log(`   描述: ${clientType.description}`);
+      // 简化日志输出
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('WebSocket连接', `${clientType.description} - ${remoteAddress}`);
+      }
       
       // 根据客户端类型处理连接
       switch (clientType.type) {
         case 'llonebot':
-          console.log(`🤖 处理LLOneBot连接`);
           this.handleLLOneBotConnection(ws, req);
           break;
           
         case 'web_client':
-          console.log(`🌐 处理Web前端客户端连接: ${clientId}`);
           this.handleWebClientConnection(ws, req, clientId, clientType);
           break;
           
         case 'unknown':
-          console.log(`⚠️ 未知来源连接: ${clientId}`);
+          logger.warning('未知连接', `${clientId.substring(0, 8)}... 来自 ${remoteAddress}`);
           this.handleUnknownConnection(ws, req, clientId, clientType);
           break;
           
         default:
-          console.log(`❌ 拒绝无效连接: ${clientType.type}`);
+          logger.warning('拒绝连接', `${clientType.type} (${remoteAddress})`);
           ws.close(1008, '不支持的客户端类型');
       }
     });
 
     // 处理WebSocket服务器错误
     this.wss.on('error', (error) => {
-      console.error('❌ WebSocket服务器错误:', error);
+      logger.error('WebSocket服务器', error.message);
     });
 
     // 连接到LLOneBot正向WebSocket（仅在配置有效时）
     if (llonebotConfig.enabled !== false && llonebotConfig.wsUrl && !llonebotConfig.wsUrl.includes('://:/')) {
       this.connectToLLOneBot();
     } else {
-      logger.warn('⚠️  LLOneBot 未配置或已禁用，跳过连接');
-      logger.warn('   如需启用，请运行: node init.js');
+      logger.warn('⚠️  LLOneBot 未配置或已禁用');
     }
 
     // 启动心跳
     this.startHeartbeat();
     
-    // 延迟加载登录信息（确保LLOneBot连接稳定）
-    setTimeout(async () => {
-      console.log('🔄 后端启动后加载登录信息...');
-      await this.loadLoginInfo();
-    }, 3000);
-
-    console.log('✅ KiBot服务器启动完成 - HTTP API + QQ Bot WebSocket架构');
-    
     // 启动安全中间件的定期清理
     this.securityMiddleware.startPeriodicCleanup();
+    
+    // 启动自动清理任务
+    this.startAutoCleanupTask();
     
     // 初始化插件系统
     setTimeout(async () => {
       try {
-        console.log('🔄 开始初始化插件系统...');
         await this.pluginManager.initialize();
-        console.log('🔌 插件系统启动完成');
-        console.log(`📊 插件系统状态: ${this.pluginManager.plugins.size} 个插件已加载`);
+        
+        // 加载登录信息（确保LLOneBot连接稳定）
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this.loadLoginInfo();
+        
+        // 标记初始化完成
+        this.isInitialized = true;
+        logger.success('系统启动', '所有初始化已完成，开始处理事件');
       } catch (error) {
-        console.error('❌ 插件系统启动失败:', error);
-        console.error('❌ 插件系统启动错误堆栈:', error.stack);
+        logger.error('插件系统', '启动失败: ' + error.message);
+        this.isInitialized = true; // 即使失败也标记为完成，避免阻塞
       }
     }, 2000);
+  }
+  
+  /**
+   * 启动自动清理任务
+   * 每天凌晨2点检查并清理过期数据
+   */
+  startAutoCleanupTask() {
+    // 计算到明天凌晨2点的时间间隔
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(2, 0, 0, 0); // 设置为明天凌晨2点
+    
+    const timeUntilFirstRun = tomorrow.getTime() - now.getTime();
+    
+    logger.info('自动清理', `首次运行将在 ${Math.round(timeUntilFirstRun / 1000 / 60 / 60)} 小时后 (凌晨2点)`);
+    
+    // 首次执行
+    setTimeout(() => {
+      this.runAutoCleanup();
+      
+      // 然后每24小时执行一次
+      this.autoCleanupInterval = setInterval(() => {
+        this.runAutoCleanup();
+      }, 24 * 60 * 60 * 1000); // 24小时
+      
+    }, timeUntilFirstRun);
+  }
+  
+  /**
+   * 执行自动清理
+   */
+  async runAutoCleanup() {
+    try {
+      // 读取系统设置
+      const settingsPath = path.join(__dirname, 'data', 'system-settings.json');
+      let settings = {
+        autoCleanup: true,
+        dataRetentionDays: 30
+      };
+      
+      if (fs.existsSync(settingsPath)) {
+        try {
+          const savedSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+          settings = { ...settings, ...savedSettings };
+        } catch (error) {
+          logger.warn('自动清理', '读取设置失败，使用默认值');
+        }
+      }
+      
+      // 检查是否启用自动清理
+      if (!settings.autoCleanup) {
+        logger.info('自动清理', '已禁用，跳过清理');
+        return;
+      }
+      
+      logger.info('自动清理', `开始清理 ${settings.dataRetentionDays} 天前的数据`);
+      
+      const dataDir = path.join(__dirname, 'data');
+      const cutoffTime = Date.now() - (settings.dataRetentionDays * 24 * 60 * 60 * 1000);
+      
+      let totalDeletedFiles = 0;
+      let totalDeletedSize = 0;
+      
+      // 清理函数
+      const cleanupDir = (dirPath) => {
+        if (!fs.existsSync(dirPath)) return;
+        
+        try {
+          const items = fs.readdirSync(dirPath);
+          for (const item of items) {
+            const itemPath = path.join(dirPath, item);
+            try {
+              const stat = fs.statSync(itemPath);
+              
+              if (stat.isFile() && stat.mtimeMs < cutoffTime) {
+                const size = stat.size;
+                fs.unlinkSync(itemPath);
+                totalDeletedFiles++;
+                totalDeletedSize += size;
+              } else if (stat.isDirectory()) {
+                cleanupDir(itemPath);
+                // 尝试删除空目录
+                try {
+                  if (fs.readdirSync(itemPath).length === 0) {
+                    fs.rmdirSync(itemPath);
+                  }
+                } catch (e) {
+                  // 忽略
+                }
+              }
+            } catch (e) {
+              // 忽略无法访问的文件
+            }
+          }
+        } catch (e) {
+          // 忽略无法访问的目录
+        }
+      };
+      
+      // 清理各类数据
+      cleanupDir(path.join(dataDir, 'statistics'));
+      cleanupDir(path.join(dataDir, 'logs'));
+      cleanupDir(path.join(dataDir, 'backups'));
+      
+      if (totalDeletedFiles > 0) {
+        const sizeMB = Math.round(totalDeletedSize / 1024 / 1024 * 100) / 100;
+        logger.success('自动清理', `已删除 ${totalDeletedFiles} 个文件，释放 ${sizeMB}MB 空间`);
+      } else {
+        logger.info('自动清理', '没有需要清理的文件');
+      }
+      
+    } catch (error) {
+      logger.error('自动清理', `执行失败: ${error.message}`);
+    }
   }
 
 
@@ -930,15 +1095,18 @@ class KiBotWebSocketServer {
    * 处理Web前端客户端连接
    */
   async handleWebClientConnection(ws, req, clientId, clientType) {
-    console.log(`🌐 Web客户端连接: ${clientId}`);
-    console.log(`   来源: ${clientType.origin || '未知'}`);
+    if (process.env.LOG_LEVEL === 'debug') {
+      logger.debug('Web客户端', `连接: ${clientId.substring(0, 8)}... (${clientType.origin || '未知'})`);
+    }
     
     // 使用安全中间件进行WebSocket连接认证
     const authResult = await this.securityMiddleware.authenticateWebSocketConnection(req, ws);
     
     if (!authResult.success) {
       if (authResult.needAuth) {
-        console.log(`🔐 客户端需要认证: ${clientId}`);
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('客户端认证', `需要认证: ${clientId.substring(0, 8)}...`);
+        }
         
         // 存储未认证的临时连接
         this.clients.set(clientId, {
@@ -968,13 +1136,15 @@ class KiBotWebSocketServer {
         });
       } else {
         // 认证失败，关闭连接
-        console.error(`❌ 客户端连接认证失败: ${clientId} - ${authResult.error}`);
+        logger.error('客户端认证', `失败: ${clientId.substring(0, 8)}... - ${authResult.error}`);
         ws.close(1008, authResult.message || '认证失败');
         return;
       }
     } else {
       // 认证成功
-      console.log(`✅ 客户端认证成功: ${clientId} (权限: ${authResult.permission})`);
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('客户端认证', `成功: ${clientId.substring(0, 8)}... (${authResult.permission})`);
+      }
       
       // 存储认证后的客户端信息
       this.clients.set(clientId, {
@@ -1031,13 +1201,15 @@ class KiBotWebSocketServer {
 
     // 处理连接关闭
     ws.on('close', (code, reason) => {
-      console.log(`🌐 Web客户端断开连接: ${clientId} (code: ${code}, reason: ${reason})`);
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('Web客户端', `断开: ${clientId.substring(0, 8)}... (code: ${code})`);
+      }
       this.clients.delete(clientId);
     });
 
     // 处理连接错误
     ws.on('error', (error) => {
-      console.error(`❌ Web客户端连接错误 [${clientId}]:`, error);
+      logger.error('Web客户端', `连接错误 [${clientId.substring(0, 8)}...]: ${error.message}`);
       this.clients.delete(clientId);
     });
   }
@@ -1119,11 +1291,11 @@ class KiBotWebSocketServer {
     try {
       // 🚫 检查是否已有活跃连接，避免重复连接
       if (this.llonebotWs && this.llonebotWs.readyState === WebSocket.OPEN) {
-        console.log('ℹ️ LLOneBot连接已存在，跳过重复连接');
+        logger.info('LLOneBot', '连接已存在');
         return;
       }
       
-      console.log(`🔗 正在连接到LLOneBot正向WebSocket: ${CONFIG.LLONEBOT_WS_URL}`);
+      logger.startup('LLOneBot', `连接中: ${CONFIG.LLONEBOT_WS_URL}`);
       
       const ws = new WebSocket(CONFIG.LLONEBOT_WS_URL, {
         headers: CONFIG.LLONEBOT_ACCESS_TOKEN ? {
@@ -1134,7 +1306,7 @@ class KiBotWebSocketServer {
       });
 
       ws.on('open', () => {
-        console.log('✅ 已连接到LLOneBot正向WebSocket');
+        logger.success('LLOneBot', '已连接');
         this.llonebotWs = ws;
         
         // 更新UserApiService的WebSocket连接
@@ -1153,9 +1325,8 @@ class KiBotWebSocketServer {
           }
         });
         
-        // 立即加载登录信息
+        // 立即加载登录信息（静默，不输出日志，避免干扰启动流程）
         setTimeout(() => {
-          console.log('🔄 LLOneBot连接后立即加载登录信息...');
           this.loadLoginInfo();
         }, 1000);
       });
@@ -1166,13 +1337,17 @@ class KiBotWebSocketServer {
           
           // 检查是否是API响应（包含echo字段）
           if (message.echo) {
-            console.log('📬 收到LLOneBot API响应:', message.echo);
+            // 简化日志 - 只在调试模式显示
+            // console.log('📬 API响应:', message.echo);
             this.handleLLOneBotApiResponse(message);
             return;
           }
           
           // 否则作为事件处理
-          console.log('📨 收到LLOneBot事件:', message.post_type || 'unknown');
+          // 只在初始化完成后才输出事件日志
+          if (this.isInitialized) {
+            logger.event('LLOneBot', `收到事件: ${message.post_type || 'unknown'}`);
+          }
           
           // 如果是心跳事件，记录但不广播
           if (message.post_type === 'meta_event' && message.meta_event_type === 'heartbeat') {
@@ -1180,7 +1355,12 @@ class KiBotWebSocketServer {
             return;
           }
           
-          // 🚀 后端直接处理事件（不依赖前端）
+          // 🚀 后端直接处理事件（不依赖前端）- 仅在初始化完成后处理
+          if (!this.isInitialized) {
+            // 初始化期间静默跳过事件处理
+            return;
+          }
+          
           this.handleEventInBackend(message).then(backendHandled => {
             // 广播事件给前端客户端（用于显示），标记是否已被后端处理
             const eventToClient = {
@@ -1190,18 +1370,20 @@ class KiBotWebSocketServer {
             };
             this.broadcastEvent(eventToClient);
           }).catch(error => {
-            console.error('❌ 后端事件处理失败:', error);
+            logger.error('后端事件', '处理失败: ' + error.message);
             // 即使后端处理失败，也要广播事件
             this.broadcastEvent(message);
           });
         } catch (error) {
-          console.error('❌ 解析LLOneBot消息失败:', error);
-          console.log('原始数据:', data.toString().substring(0, 200));
+          logger.error('消息解析', '失败: ' + error.message);
+          if (process.env.LOG_LEVEL === 'debug') {
+            logger.debug('原始数据', data.toString().substring(0, 200));
+          }
         }
       });
 
       ws.on('close', (code, reason) => {
-        console.log(`🔌 LLOneBot WebSocket连接已断开 (code: ${code}, reason: ${reason})`);
+        logger.warning('LLOneBot', `连接断开 (code: ${code})`);
         this.llonebotWs = null;
         
         // 发送断开连接事件给客户端
@@ -1220,23 +1402,23 @@ class KiBotWebSocketServer {
         // 5秒后重新连接
         setTimeout(() => {
           if (!this.llonebotWs) {
-            console.log('🔄 尝试重新连接到LLOneBot...');
+            logger.info('LLOneBot', '尝试重新连接...');
             this.connectToLLOneBot();
           }
         }, 5000);
       });
 
       ws.on('error', (error) => {
-        console.error('❌ LLOneBot WebSocket连接错误:', error);
+        logger.error('LLOneBot', '连接错误: ' + error.message);
         this.llonebotWs = null;
       });
       
     } catch (error) {
-      console.error('❌ 连接LLOneBot失败:', error);
+      logger.error('LLOneBot', '连接失败: ' + error.message);
       
       // 5秒后重试
       setTimeout(() => {
-        console.log('🔄 尝试重新连接到LLOneBot...');
+        logger.info('LLOneBot', '尝试重新连接...');
         this.connectToLLOneBot();
       }, 5000);
     }
@@ -1290,16 +1472,9 @@ class KiBotWebSocketServer {
           timestamp: event.time ? event.time * 1000 : Date.now()
         };
         
-        monitorDataManager.recordMessage(messageData);
+        systemStatistics.recordMessage(messageData);
         
-        // 记录系统指标
-        const systemMetrics = {
-          responseTime: Math.random() * 100 + 20, // 实际应该是真实的响应时间
-          memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
-          cpuUsage: Math.random() * 50 + 10 // 实际应该通过系统API获取
-        };
-        
-        monitorDataManager.recordSystemMetrics(systemMetrics);
+        // 系统指标由 systemStatistics 自动收集，无需手动记录
       }
     } catch (error) {
       logger.error('监控数据', '记录失败', error);
@@ -1370,15 +1545,17 @@ class KiBotWebSocketServer {
         }
       }
       
-      // 如果是连接事件，加载登录信息
+      // 如果是连接事件，加载登录信息（但避免重复加载）
       if (event.post_type === 'meta_event' && event.meta_event_type === 'lifecycle' && event.sub_type === 'connect') {
-        console.log('🔄 LLOneBot连接成功，加载登录信息...');
-        await this.loadLoginInfo();
+        if (!this.loginInfo) {
+          // 初始化期间不输出，避免干扰启动日志
+          await this.loadLoginInfo();
+        }
         processed = true;
       }
       
     } catch (error) {
-      console.error('❌ 后端事件处理失败:', error);
+      logger.error('事件处理', error.message);
     }
     
     return processed;
@@ -1391,22 +1568,27 @@ class KiBotWebSocketServer {
     try {
       // 确保WebSocket连接可用
       if (!this.llonebotWs || this.llonebotWs.readyState !== 1) {
-        console.log('⏳ WebSocket未连接，等待连接后再加载登录信息');
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('登录信息', 'WebSocket未连接，等待中');
+        }
         return;
       }
 
-      console.log('🔄 通过WebSocket加载登录信息...');
       const response = await this.callLLOneBotViaWebSocket('get_login_info', {});
       
       if (response.retcode === 0) {
         this.loginInfo = response.data;
         this.eventEngine.setLoginInfo(this.loginInfo);
-        console.log('✅ 登录信息已加载:', this.loginInfo.nickname);
+        
+        // 只在初始化完成后才输出
+        if (this.isInitialized) {
+          logger.success('登录信息', `${this.loginInfo.nickname} (${this.loginInfo.user_id})`);
+        }
       } else {
-        console.error('❌ 登录信息API返回错误:', response);
+        logger.error('登录信息', '加载失败: ' + (response.msg || '未知错误'));
       }
     } catch (error) {
-      console.error('❌ 加载登录信息失败:', error);
+      logger.error('登录信息', '加载失败: ' + error.message);
     }
   }
 
@@ -1544,10 +1726,11 @@ class KiBotWebSocketServer {
     try {
       // 检查响应状态
       if (status === 'ok' && retcode === 0) {
-        console.log(`✅ WebSocket API调用成功: ${pendingRequest.action}`);
+        // 简化成功日志 - 只显示关键信息
+        // console.log(`✅ API成功: ${pendingRequest.action}`);
         pendingRequest.resolve({ status, retcode, data, message, wording });
       } else {
-        console.error(`❌ WebSocket API调用失败: ${pendingRequest.action}, retcode: ${retcode}, message: ${message}`);
+        console.error(`❌ API失败: ${pendingRequest.action} (${retcode}): ${message}`);
         pendingRequest.reject(new Error(`LLOneBot API错误 (${retcode}): ${message || wording || '未知错误'}`));
       }
     } catch (error) {
@@ -1600,7 +1783,7 @@ class KiBotWebSocketServer {
    */
   async handleLogsApi(action, params) {
     try {
-      logger.debug('日志API', `处理请求: ${action}`, params);
+      logger.debug('日志API', `${action} - ${JSON.stringify(params)}`);
       
       switch (action) {
         case 'logs_get_history':
@@ -1823,7 +2006,7 @@ class KiBotWebSocketServer {
     
     // 检查客户端是否已认证
     if (!client.authenticated) {
-      console.warn(`🚫 未认证客户端尝试调用API: ${clientId} - ${action}`);
+      logger.warning('未认证API', `${clientId.substring(0, 8)}... 尝试调用 ${action}`);
       
       this.sendToClient(client.ws, {
         type: 'api_response',
@@ -1849,7 +2032,7 @@ class KiBotWebSocketServer {
     );
 
     if (!validationResult.success) {
-      console.warn(`🚫 API调用权限验证失败: ${clientId} - ${action} - ${validationResult.error}`);
+      logger.warning('权限验证', `${action} - ${validationResult.error} (客户端: ${clientId.substring(0, 8)}...)`);
       
       this.sendToClient(client.ws, {
         type: 'api_response',
@@ -1864,74 +2047,59 @@ class KiBotWebSocketServer {
 
     // 如果是敏感操作，记录额外的日志
     if (validationResult.isSensitive) {
-      console.warn(`⚠️ 敏感操作执行: ${action} (客户端: ${clientId}, 权限: ${client.permission})`);
+      logger.warning('敏感操作', `${action} (客户端: ${clientId.substring(0, 8)}..., 权限: ${client.permission})`);
     }
     
-    console.log(`🔧 收到API调用请求: ${action}`, params);
-    console.log(`🔍 检查API类型: action="${action}"`);
-    console.log(`    rules_检查: ${action.startsWith('rules_')}`);
-    console.log(`    groups_检查: ${action.startsWith('groups_')}`);
-    console.log(`    plugins_检查: ${action.startsWith('plugins_')}`);
-    console.log(`    内部API检查: ${action.startsWith('internal_')}`);  
+    // 只在debug模式下记录API调用详情
+    if (process.env.LOG_LEVEL === 'debug') {
+      logger.debug('API调用', `${action} from ${clientId.substring(0, 8)}...`);
+    }
 
     try {
       let response;
       
       // 首先检查是否是规则管理API  
       if (action.startsWith('rules_')) {
-        console.log(`📋 识别为规则管理API，调用本地处理: ${action}`);
         response = await this.handleRulesApi(action, params);
-        console.log(`📋 规则API响应:`, response);
       }
       // 检查是否是分组管理API
       else if (action.startsWith('groups_')) {
-        console.log(`📂 识别为分组管理API，调用本地处理: ${action}`);
         response = await this.handleRulesApi(action, params);
-        console.log(`📂 分组API响应:`, response);
       }
       // 检查是否是后端内部API
       else if (action.startsWith('internal_')) {
-        console.log(`🔧 识别为后端内部API，调用本地处理: ${action}`);
         response = await this.handleRulesApi(action, params);
-        console.log(`🔧 内部API响应:`, response);
       }
       // 检查是否是插件管理API
       else if (action.startsWith('plugins_')) {
-        console.log(`🔌 识别为插件管理API，调用本地处理: ${action}`);
         response = await this.handleRulesApi(action, params);
-        console.log(`🔌 插件API响应:`, response);
       }
       // 统一监控API处理 - 修复API混乱问题
       else if (action === 'monitor_stats' || action === 'monitor_realtime' || action === 'monitor_get_stats') {
-        console.log(`📊 识别为监控API，统一使用MonitorDataManager处理: ${action}`);
         response = await this.handleMonitorApiNew(action, params);
-        console.log(`📊 监控API响应:`, response);
       }
       // 检查是否是日志管理API
       else if (action.startsWith('logs_')) {
-        console.log(`📝 识别为日志管理API，调用本地处理: ${action}`);
         response = await this.handleLogsApi(action, params);
-        console.log(`📝 日志API响应:`, response);
       }
       // 检查是否是新版监控API
       else if (action.startsWith('monitor_')) {
-        console.log(`📊 识别为新版监控API，调用本地处理: ${action}`);
         response = await this.handleMonitorApiNew(action, params);
-        console.log(`📊 新版监控API响应:`, response);
       }
       // 检查是否是任务管理API
       else if (action.startsWith('tasks_')) {
-        console.log(`⏰ 识别为任务管理API，调用本地处理: ${action}`);
         response = await this.handleTasksApi(action, params);
-        console.log(`⏰ 任务管理API响应:`, response);
+      }
+      // 检查是否是系统性能API
+      else if (action === 'system_performance' || action === 'plugin_performance' || action === 'clear_api_stats' || action === 'clear_plugins_performance') {
+        response = await this.handleRulesApi(action, params);
       }
       // 优先通过WebSocket调用（如果LLOneBot已连接）
       else if (this.llonebotWs && this.llonebotWs.readyState === 1) {
-        console.log(`📡 识别为LLOneBot API，通过WebSocket调用: ${action}`);
         response = await this.callLLOneBotViaWebSocket(action, params, id);
       } else {
         // WebSocket未连接，只能处理本地API
-        console.log(`❌ WebSocket未连接，无法调用LLOneBot API: ${action}`);
+        logger.error('API调用', `${action} - WebSocket未连接`);
         throw new Error('WebSocket未连接，无法调用LLOneBot API。请等待连接建立。');
       }
 
@@ -1943,7 +2111,7 @@ class KiBotWebSocketServer {
       });
 
     } catch (error) {
-      console.error(`❌ API调用失败 ${action}:`, error);
+      logger.error('API调用', `${action} 失败: ${error.message}`);
       
       this.sendToClient(client.ws, {
         type: 'api_response',
@@ -1963,7 +2131,10 @@ class KiBotWebSocketServer {
    */
   async handleRulesApi(action, params) {
     try {
-      console.log(`🔧 规则管理API: ${action}`, params);
+      // 只在debug模式下记录
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('规则API', `${action}: ${JSON.stringify(params)}`);
+      }
       
       switch (action) {
         case 'rules_get_all':
@@ -2197,12 +2368,68 @@ class KiBotWebSocketServer {
             message: '获取插件详细信息成功'
           };
 
+        case 'plugins_performance':
+          // 获取所有插件的性能数据
+          const performanceData = this.pluginManager.getAllPluginsPerformance();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: performanceData,
+            message: '获取插件性能数据成功'
+          };
+
+        case 'plugin_performance':
+          // 获取单个插件的性能数据
+          if (!params.pluginId) {
+            throw new Error('缺少插件ID');
+          }
+          const pluginPerf = this.pluginManager.getPluginPerformance(params.pluginId);
+          if (!pluginPerf) {
+            throw new Error('插件不存在或未加载');
+          }
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: pluginPerf,
+            message: '获取插件性能数据成功'
+          };
+
+        case 'system_performance':
+          // 获取系统性能数据
+          const systemPerformance = this.getSystemPerformance();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: systemPerformance,
+            message: '获取系统性能数据成功'
+          };
+
+        case 'clear_api_stats':
+          // 清理API统计数据
+          const clearResult = this.systemStats.clearHttpStats();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: clearResult,
+            message: 'API统计数据已清理'
+          };
+
+        case 'clear_plugins_performance':
+          // 清理所有插件性能数据
+          const clearPluginsResult = this.pluginManager.clearAllPluginsPerformance();
+          return {
+            status: 'ok',
+            retcode: 0,
+            data: clearPluginsResult,
+            message: clearPluginsResult.message
+          };
+
         case 'plugins_enable':
           // 启用插件
           if (!params.pluginId) {
             throw new Error('缺少插件ID');
           }
-          console.log(`🚀 API请求启用插件: ${params.pluginId}`);
+          logger.info('插件管理', `启用插件: ${params.pluginId}`);
           await this.pluginManager.enablePlugin(params.pluginId);
           return {
             status: 'ok',
@@ -2308,7 +2535,7 @@ class KiBotWebSocketServer {
           throw new Error(`未知的规则API: ${action}`);
       }
     } catch (error) {
-      console.error(`❌ 规则管理API失败: ${action}`, error);
+      logger.error('规则API', `${action}: ${error.message}`);
       return {
         status: 'failed',
         retcode: -1,
@@ -2325,7 +2552,7 @@ class KiBotWebSocketServer {
    */
   async handleSystemApi(action, params) {
     try {
-      console.log(`⚙️ 处理系统API: ${action}`, params);
+      logger.debug('系统API', `${action} - ${JSON.stringify(params)}`);
       
       switch (action) {
         case 'get_status':
@@ -2336,7 +2563,7 @@ class KiBotWebSocketServer {
             data: {
               online: true,
               uptime: process.uptime(),
-              version: '1.0.0',
+              version: SERVER_VERSION,
               timestamp: Date.now(),
               connections: {
                 llonebot: this.llonebotWs ? (this.llonebotWs.readyState === 1) : false,
@@ -2613,8 +2840,8 @@ class KiBotWebSocketServer {
                 status: 'ok',
                 retcode: 0,
                 data: {
-                  version: '1.4.9',
-                  releaseDate: '2025-10-21',
+                  version: SERVER_VERSION,
+                  releaseDate: '2025-10-25',
                   changelog: []
                 },
                 message: '更新日志文件不存在'
@@ -2626,6 +2853,535 @@ class KiBotWebSocketServer {
               retcode: -1,
               data: null,
               message: `获取更新日志失败: ${error.message}`
+            };
+          }
+
+        case 'get_system_settings':
+          // 获取系统设置
+          try {
+            const settingsPath = path.join(__dirname, 'data', 'system-settings.json');
+            let settings = {
+              dataPath: './data',
+              statisticsPath: './data/statistics',
+              logsPath: './data/logs',
+              backupPath: './data/backups',
+              autoRefresh: true,
+              refreshInterval: 30,
+              dataRetentionDays: 30,
+              autoCleanup: true,
+              enableMonitoring: true,
+              monitoringInterval: 60,
+              enablePerformanceTracking: true,
+              maxLogEntries: 1000
+            };
+            
+            // 尝试从文件加载设置
+            if (fs.existsSync(settingsPath)) {
+              try {
+                const savedSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+                settings = { ...settings, ...savedSettings };
+              } catch (error) {
+                logger.warn('系统设置', '加载设置文件失败，使用默认设置');
+              }
+            }
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: settings,
+              message: '获取系统设置成功'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `获取系统设置失败: ${error.message}`
+            };
+          }
+
+        case 'update_system_settings':
+          // 更新系统设置
+          try {
+            const settingsPath = path.join(__dirname, 'data', 'system-settings.json');
+            const dataDir = path.join(__dirname, 'data');
+            
+            // 确保data目录存在
+            if (!fs.existsSync(dataDir)) {
+              fs.mkdirSync(dataDir, { recursive: true });
+            }
+            
+            // 保存设置到文件
+            fs.writeFileSync(settingsPath, JSON.stringify(params, null, 2), 'utf8');
+            
+            logger.success('系统设置', '设置已更新');
+            
+            // 通知系统统计模块重新加载设置
+            if (systemStatistics && typeof systemStatistics.reloadSettings === 'function') {
+              systemStatistics.reloadSettings();
+              logger.info('系统设置', '监控配置已重新加载');
+            }
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: params,
+              message: '系统设置保存成功，部分配置已生效'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `保存系统设置失败: ${error.message}`
+            };
+          }
+
+        case 'get_disk_usage':
+          // 获取磁盘使用情况
+          try {
+            const dataDir = path.join(__dirname, 'data');
+            let totalSize = 0;
+            
+            // 递归计算目录大小
+            const calculateDirSize = (dirPath) => {
+              let size = 0;
+              if (!fs.existsSync(dirPath)) return size;
+              
+              try {
+                const files = fs.readdirSync(dirPath);
+                for (const file of files) {
+                  const filePath = path.join(dirPath, file);
+                  try {
+                    const stat = fs.statSync(filePath);
+                    if (stat.isFile()) {
+                      size += stat.size;
+                    } else if (stat.isDirectory()) {
+                      size += calculateDirSize(filePath);
+                    }
+                  } catch (e) {
+                    // 忽略无法访问的文件
+                  }
+                }
+              } catch (e) {
+                // 忽略无法访问的目录
+              }
+              return size;
+            };
+            
+            totalSize = calculateDirSize(dataDir);
+            
+            // 获取系统磁盘信息（仅Unix/Linux系统）
+            let diskInfo = {
+              total: 0,
+              used: 0,
+              free: 0,
+              usage: 0
+            };
+            
+            // 在Windows上可以使用data目录所在磁盘的信息
+            if (os.platform() === 'win32') {
+              // Windows上只返回数据目录大小
+              diskInfo = {
+                total: totalSize * 100, // 估算
+                used: totalSize,
+                free: totalSize * 99,
+                usage: 1
+              };
+            } else {
+              // Unix/Linux系统尝试读取磁盘信息
+              try {
+                const { execSync } = require('child_process');
+                const dfOutput = execSync(`df -k "${dataDir}"`).toString();
+                const lines = dfOutput.split('\n');
+                if (lines.length > 1) {
+                  const parts = lines[1].split(/\s+/);
+                  if (parts.length >= 5) {
+                    diskInfo = {
+                      total: parseInt(parts[1]) * 1024,
+                      used: parseInt(parts[2]) * 1024,
+                      free: parseInt(parts[3]) * 1024,
+                      usage: parseInt(parts[4])
+                    };
+                  }
+                }
+              } catch (e) {
+                // 如果命令失败，使用data目录大小
+                diskInfo = {
+                  total: totalSize * 100,
+                  used: totalSize,
+                  free: totalSize * 99,
+                  usage: 1
+                };
+              }
+            }
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: {
+                ...diskInfo,
+                dataSize: totalSize
+              },
+              message: '获取磁盘使用情况成功'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: {
+                total: 0,
+                used: 0,
+                free: 0,
+                usage: 0,
+                dataSize: 0
+              },
+              message: `获取磁盘使用情况失败: ${error.message}`
+            };
+          }
+
+        case 'get_data_stats':
+          // 获取各类数据的统计信息
+          try {
+            const dataDir = path.join(__dirname, 'data');
+            
+            // 计算目录大小和文件数
+            const getDirStats = (dirPath) => {
+              let size = 0;
+              let files = 0;
+              
+              if (!fs.existsSync(dirPath)) {
+                return { size: 0, files: 0 };
+              }
+              
+              try {
+                const items = fs.readdirSync(dirPath);
+                for (const item of items) {
+                  const itemPath = path.join(dirPath, item);
+                  try {
+                    const stat = fs.statSync(itemPath);
+                    if (stat.isFile()) {
+                      size += stat.size;
+                      files++;
+                    } else if (stat.isDirectory()) {
+                      const subStats = getDirStats(itemPath);
+                      size += subStats.size;
+                      files += subStats.files;
+                    }
+                  } catch (e) {
+                    // 忽略无法访问的文件
+                  }
+                }
+              } catch (e) {
+                // 忽略无法访问的目录
+              }
+              
+              return { size, files };
+            };
+            
+            const statisticsStats = getDirStats(path.join(dataDir, 'statistics'));
+            const logsStats = getDirStats(path.join(dataDir, 'logs'));
+            const backupsStats = getDirStats(path.join(dataDir, 'backups'));
+            
+            const totalSize = statisticsStats.size + logsStats.size + backupsStats.size;
+            const totalFiles = statisticsStats.files + logsStats.files + backupsStats.files;
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: {
+                statistics: statisticsStats,
+                logs: logsStats,
+                backups: backupsStats,
+                total: {
+                  size: totalSize,
+                  files: totalFiles
+                }
+              },
+              message: '获取数据统计成功'
+            };
+          } catch (error) {
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `获取数据统计失败: ${error.message}`
+            };
+          }
+
+        case 'cleanup_data':
+          // 清理过期数据
+          try {
+            const { type, daysToKeep = 30 } = params;
+            const dataDir = path.join(__dirname, 'data');
+            const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
+            const cutoffDate = new Date(cutoffTime).toLocaleString('zh-CN');
+            
+            logger.info('数据清理', `开始清理 ${type} 类型的数据，保留 ${daysToKeep} 天内的文件 (${cutoffDate} 之后)`);
+            
+            let deletedFiles = 0;
+            let deletedSize = 0;
+            let scannedFiles = 0;
+            const deletedList = [];
+            
+            // 清理指定目录中的过期文件
+            const cleanupDir = (dirPath, dirName = '') => {
+              if (!fs.existsSync(dirPath)) {
+                logger.info('数据清理', `目录不存在，跳过: ${dirPath}`);
+                return;
+              }
+              
+              logger.info('数据清理', `正在扫描目录: ${dirPath}`);
+              
+              try {
+                const items = fs.readdirSync(dirPath);
+                logger.info('数据清理', `找到 ${items.length} 个项目`);
+                
+                for (const item of items) {
+                  const itemPath = path.join(dirPath, item);
+                  try {
+                    const stat = fs.statSync(itemPath);
+                    scannedFiles++;
+                    
+                    if (stat.isFile()) {
+                      const fileAge = Date.now() - stat.mtimeMs;
+                      const fileAgeDays = Math.floor(fileAge / (24 * 60 * 60 * 1000));
+                      
+                      logger.debug('数据清理', `文件: ${item}, 修改时间: ${new Date(stat.mtimeMs).toLocaleString('zh-CN')}, 年龄: ${fileAgeDays} 天`);
+                      
+                      if (stat.mtimeMs < cutoffTime) {
+                        const size = stat.size;
+                        fs.unlinkSync(itemPath);
+                        deletedFiles++;
+                        deletedSize += size;
+                        deletedList.push({ file: item, size, dir: dirName });
+                        logger.info('数据清理', `✓ 删除文件: ${item} (${Math.round(size / 1024)}KB, ${fileAgeDays}天前)`);
+                      } else {
+                        logger.debug('数据清理', `✗ 保留文件: ${item} (${fileAgeDays}天前，未超过${daysToKeep}天)`);
+                      }
+                    } else if (stat.isDirectory()) {
+                      cleanupDir(itemPath, `${dirName}/${item}`);
+                      // 尝试删除空目录
+                      try {
+                        if (fs.readdirSync(itemPath).length === 0) {
+                          fs.rmdirSync(itemPath);
+                          logger.info('数据清理', `✓ 删除空目录: ${item}`);
+                        }
+                      } catch (e) {
+                        // 忽略
+                      }
+                    }
+                  } catch (e) {
+                    logger.warn('数据清理', `无法处理: ${item} - ${e.message}`);
+                  }
+                }
+              } catch (e) {
+                logger.warn('数据清理', `无法读取目录: ${dirPath} - ${e.message}`);
+              }
+            };
+            
+            // 根据类型清理对应的目录
+            const dirsToClean = [];
+            switch (type) {
+              case 'statistics':
+                dirsToClean.push({ path: path.join(dataDir, 'statistics'), name: '统计数据' });
+                dirsToClean.push({ path: path.join(dataDir, 'monitoring'), name: '监控数据' });
+                break;
+              case 'logs':
+                dirsToClean.push({ path: path.join(dataDir, 'logs'), name: '日志文件' });
+                break;
+              case 'backups':
+                dirsToClean.push({ path: path.join(dataDir, 'backups'), name: '备份文件' });
+                dirsToClean.push({ path: path.join(dataDir, 'monitoring', 'backups'), name: '监控备份' });
+                break;
+              case 'all':
+                dirsToClean.push({ path: path.join(dataDir, 'statistics'), name: '统计数据' });
+                dirsToClean.push({ path: path.join(dataDir, 'monitoring'), name: '监控数据' });
+                dirsToClean.push({ path: path.join(dataDir, 'logs'), name: '日志文件' });
+                dirsToClean.push({ path: path.join(dataDir, 'backups'), name: '备份文件' });
+                break;
+              default:
+                throw new Error('未知的清理类型');
+            }
+            
+            // 执行清理
+            for (const dir of dirsToClean) {
+              logger.info('数据清理', `===== 开始清理 ${dir.name} =====`);
+              cleanupDir(dir.path, dir.name);
+            }
+            
+            const sizeMB = Math.round(deletedSize / 1024 / 1024 * 100) / 100;
+            const summaryMsg = deletedFiles > 0 
+              ? `已删除 ${deletedFiles} 个文件，释放 ${sizeMB}MB 空间`
+              : `没有找到需要清理的文件 (扫描了 ${scannedFiles} 个文件)`;
+            
+            logger.success('数据清理', summaryMsg);
+            
+            if (deletedList.length > 0) {
+              logger.info('数据清理', '清理详情:');
+              deletedList.forEach(item => {
+                logger.info('数据清理', `  - [${item.dir}] ${item.file} (${Math.round(item.size / 1024)}KB)`);
+              });
+            }
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: {
+                deletedFiles,
+                deletedSize,
+                scannedFiles,
+                type,
+                daysToKeep,
+                deletedList: deletedList.slice(0, 20), // 只返回前20个
+                cutoffDate
+              },
+              message: summaryMsg
+            };
+          } catch (error) {
+            logger.error('数据清理', error.message);
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `数据清理失败: ${error.message}`
+            };
+          }
+
+        case 'archive_old_data':
+          // 归档旧数据
+          try {
+            const { daysToKeep = 30 } = params;
+            const dataDir = path.join(__dirname, 'data');
+            const archiveDir = path.join(dataDir, 'archives');
+            const cutoffTime = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
+            const cutoffDate = new Date(cutoffTime).toLocaleString('zh-CN');
+            
+            logger.info('数据归档', `开始归档 ${daysToKeep} 天前的数据 (${cutoffDate} 之前)`);
+            
+            // 确保归档目录存在
+            if (!fs.existsSync(archiveDir)) {
+              fs.mkdirSync(archiveDir, { recursive: true });
+              logger.info('数据归档', '创建归档目录: ' + archiveDir);
+            }
+            
+            let archivedFiles = 0;
+            let archivedSize = 0;
+            let scannedFiles = 0;
+            
+            // 创建归档文件名
+            const archiveName = `archive-${new Date().toISOString().split('T')[0]}-${Date.now()}.json`;
+            const archivePath = path.join(archiveDir, archiveName);
+            const archiveData = {
+              createdAt: new Date().toISOString(),
+              daysToKeep,
+              cutoffDate,
+              files: []
+            };
+            
+            // 归档指定目录中的过期文件
+            const archiveDir_fn = (dirPath, relativeDir = '') => {
+              if (!fs.existsSync(dirPath)) {
+                logger.info('数据归档', `目录不存在，跳过: ${dirPath}`);
+                return;
+              }
+              
+              logger.info('数据归档', `正在扫描目录: ${dirPath}`);
+              
+              try {
+                const items = fs.readdirSync(dirPath);
+                logger.info('数据归档', `找到 ${items.length} 个项目`);
+                
+                for (const item of items) {
+                  const itemPath = path.join(dirPath, item);
+                  try {
+                    const stat = fs.statSync(itemPath);
+                    scannedFiles++;
+                    
+                    if (stat.isFile()) {
+                      const fileAge = Date.now() - stat.mtimeMs;
+                      const fileAgeDays = Math.floor(fileAge / (24 * 60 * 60 * 1000));
+                      
+                      if (stat.mtimeMs < cutoffTime) {
+                        // 读取文件内容
+                        const content = fs.readFileSync(itemPath, 'utf8');
+                        archiveData.files.push({
+                          path: path.join(relativeDir, item),
+                          size: stat.size,
+                          mtime: stat.mtime,
+                          content: content
+                        });
+                        
+                        archivedFiles++;
+                        archivedSize += stat.size;
+                        
+                        logger.info('数据归档', `✓ 归档文件: ${item} (${Math.round(stat.size / 1024)}KB, ${fileAgeDays}天前)`);
+                        
+                        // 删除原文件
+                        fs.unlinkSync(itemPath);
+                      } else {
+                        logger.debug('数据归档', `✗ 跳过文件: ${item} (${fileAgeDays}天前，未超过${daysToKeep}天)`);
+                      }
+                    } else if (stat.isDirectory()) {
+                      archiveDir_fn(itemPath, path.join(relativeDir, item));
+                    }
+                  } catch (e) {
+                    logger.warn('数据归档', `无法处理: ${item} - ${e.message}`);
+                  }
+                }
+              } catch (e) {
+                logger.warn('数据归档', `无法读取目录: ${dirPath} - ${e.message}`);
+              }
+            };
+            
+            // 归档所有类型的数据
+            const dirsToArchive = [
+              { path: path.join(dataDir, 'statistics'), name: 'statistics' },
+              { path: path.join(dataDir, 'monitoring'), name: 'monitoring' },
+              { path: path.join(dataDir, 'logs'), name: 'logs' },
+              { path: path.join(dataDir, 'backups'), name: 'backups' }
+            ];
+            
+            for (const dir of dirsToArchive) {
+              logger.info('数据归档', `===== 开始归档 ${dir.name} =====`);
+              archiveDir_fn(dir.path, dir.name);
+            }
+            
+            // 保存归档文件
+            if (archivedFiles > 0) {
+              fs.writeFileSync(archivePath, JSON.stringify(archiveData, null, 2));
+              const sizeMB = Math.round(archivedSize / 1024 / 1024 * 100) / 100;
+              logger.success('数据归档', `已归档 ${archivedFiles} 个文件到 ${archiveName} (${sizeMB}MB)`);
+            } else {
+              logger.info('数据归档', `没有找到需要归档的文件 (扫描了 ${scannedFiles} 个文件)`);
+            }
+            
+            const sizeMB = Math.round(archivedSize / 1024 / 1024 * 100) / 100;
+            
+            return {
+              status: 'ok',
+              retcode: 0,
+              data: {
+                archivedFiles,
+                archivedSize,
+                scannedFiles,
+                archiveName: archivedFiles > 0 ? archiveName : null,
+                archivePath: archivedFiles > 0 ? archivePath : null,
+                daysToKeep,
+                cutoffDate,
+                sizeMB
+              },
+              message: archivedFiles > 0 
+                ? `归档完成，已归档 ${archivedFiles} 个文件 (${sizeMB}MB)` 
+                : `没有找到需要归档的文件 (扫描了 ${scannedFiles} 个文件)`
+            };
+          } catch (error) {
+            logger.error('数据归档', error.message);
+            return {
+              status: 'error',
+              retcode: -1,
+              data: null,
+              message: `数据归档失败: ${error.message}`
             };
           }
 
@@ -2656,7 +3412,7 @@ class KiBotWebSocketServer {
    */
   async handleUpdaterApi(req, action, params) {
     try {
-      console.log(`🔄 处理更新器API: ${action}`);
+      logger.debug('更新器API', `${action} - ${JSON.stringify(params)}`);
       
       switch (action) {
         case 'updater_status':
@@ -2941,13 +3697,16 @@ class KiBotWebSocketServer {
    */
   async handleMonitorApiNew(action, params) {
     try {
-      console.log(`📊 处理新版监控API: ${action}`, params);
+      // 只在debug模式下记录
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('监控API', `${action}: ${JSON.stringify(params)}`);
+      }
       
       switch (action) {
         case 'monitor_stats_v2':
         case 'monitor_get_stats':
         case 'monitor_stats':  // 兼容旧版API
-          const stats = monitorDataManager.generateStatsReport(params.timeRange || '24h');
+          const stats = await systemStatistics.generateStatsReport(params.timeRange || '24h');
           return {
             status: 'ok',
             retcode: 0,
@@ -2969,7 +3728,9 @@ class KiBotWebSocketServer {
           const exportTimeRange = params.timeRange || '24h';
           const includeRawData = params.includeRawData || false;
           
-          const exportedData = monitorDataManager.exportData(exportFormat, exportTimeRange, includeRawData);
+          // 使用 systemStatistics 导出数据
+          const exportStats = await systemStatistics.generateStatsReport(exportTimeRange);
+          const exportedData = JSON.stringify(exportStats, null, 2);
           
           return {
             status: 'ok',
@@ -2986,7 +3747,7 @@ class KiBotWebSocketServer {
         
         case 'monitor_archive_data':
           const archiveDate = params.date || null;
-          const archiveFile = monitorDataManager.archiveData(archiveDate);
+          const archiveFile = await systemStatistics.archiveOldData();
           
           return {
             status: 'ok',
@@ -3039,7 +3800,7 @@ class KiBotWebSocketServer {
           };
         
         case 'monitor_get_data_quality':
-          const quality = monitorDataManager.assessDataQuality();
+          const quality = systemStatistics._assessDataQuality();
           
           return {
             status: 'ok',
@@ -3053,7 +3814,8 @@ class KiBotWebSocketServer {
           const cutoffDate = new Date();
           cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
           
-          monitorDataManager.cleanupArchivedData(cutoffDate.getTime());
+          // 使用 ArchiveManager 清理旧归档
+          systemStatistics.archiveManager.cleanOldArchives(daysToKeep);
           
           return {
             status: 'ok',
@@ -3086,7 +3848,7 @@ class KiBotWebSocketServer {
    */
   async handleTasksApi(action, params) {
     try {
-      logger.debug('任务管理API', `处理请求: ${action}`, params);
+      logger.debug('任务管理API', `${action} - ${JSON.stringify(params)}`);
       
       switch (action) {
         case 'tasks_get_all':
@@ -3252,7 +4014,10 @@ class KiBotWebSocketServer {
    */
   async handleGetChatList(params) {
     try {
-      console.log('📋 获取聊天列表');
+      // 只在debug模式下记录
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('聊天列表', '正在获取...');
+      }
       
       const chats = [];
       
@@ -3311,10 +4076,14 @@ class KiBotWebSocketServer {
               messageCount: msgInfo.messageCount
             });
           });
-          console.log(`✅ 加载了 ${friends.length} 个好友对话`);
+          if (process.env.LOG_LEVEL === 'debug') {
+            logger.debug('聊天列表', `好友: ${friends.length} 个`);
+          }
         }
       } catch (error) {
-        console.log('⚠️ 获取好友列表失败:', error.message);
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('好友列表', '获取失败: ' + error.message);
+        }
       }
       
       // 2. 从群组列表构建群聊对话
@@ -3343,10 +4112,14 @@ class KiBotWebSocketServer {
               messageCount: msgInfo.messageCount
             });
           });
-          console.log(`✅ 加载了 ${groups.length} 个群组对话`);
+          if (process.env.LOG_LEVEL === 'debug') {
+            logger.debug('聊天列表', `群组: ${groups.length} 个`);
+          }
         }
       } catch (error) {
-        console.log('⚠️ 获取群组列表失败:', error.message);
+        if (process.env.LOG_LEVEL === 'debug') {
+          logger.debug('群组列表', '获取失败: ' + error.message);
+        }
       }
       
       // 按最后消息时间排序（有消息的在前，按时间倒序）
@@ -3360,7 +4133,9 @@ class KiBotWebSocketServer {
         return (a.name || '').localeCompare(b.name || '', 'zh-CN');
       });
       
-      console.log(`✅ 返回 ${chats.length} 个对话`);
+      if (process.env.LOG_LEVEL === 'debug') {
+        logger.debug('聊天列表', `返回 ${chats.length} 个对话`);
+      }
       
       return {
         status: 'ok',
@@ -3370,7 +4145,7 @@ class KiBotWebSocketServer {
       };
       
     } catch (error) {
-      console.error('❌ 获取聊天列表失败:', error);
+      logger.error('聊天列表', '获取失败: ' + error.message);
       return {
         status: 'error',
         retcode: -1,
@@ -3483,6 +4258,8 @@ class KiBotWebSocketServer {
    * @param {string} originalId - 原始请求ID
    */
   async callLLOneBotViaWebSocket(action, params, originalId) {
+    const startTime = Date.now();
+    
     return new Promise((resolve, reject) => {
       const echo = uuidv4();
       const requestData = {
@@ -3491,12 +4268,32 @@ class KiBotWebSocketServer {
         echo
       };
       
-      console.log(`📤 发送WebSocket API请求:`, requestData);
+      // 简化的日志输出 - 只在初始化完成后显示，且仅debug模式
+      if (this.isInitialized && process.env.LOG_LEVEL === 'debug') {
+        logger.debug('WebSocket API', action);
+      }
+      
+      // 包装 resolve 以记录API统计
+      const originalResolve = resolve;
+      const wrappedResolve = (value) => {
+        const duration = Date.now() - startTime;
+        const success = value && value.retcode === 0;
+        systemStatistics.recordApiCall(action, duration, success);
+        originalResolve(value);
+      };
+      
+      // 包装 reject 以记录API统计
+      const originalReject = reject;
+      const wrappedReject = (error) => {
+        const duration = Date.now() - startTime;
+        systemStatistics.recordApiCall(action, duration, false);
+        originalReject(error);
+      };
       
       // 存储请求，等待响应
       this.pendingRequests.set(echo, {
-        resolve,
-        reject,
+        resolve: wrappedResolve,
+        reject: wrappedReject,
         timestamp: Date.now(),
         action,
         originalId
@@ -3510,12 +4307,12 @@ class KiBotWebSocketServer {
         setTimeout(() => {
           if (this.pendingRequests.has(echo)) {
             this.pendingRequests.delete(echo);
-            reject(new Error(`WebSocket API调用超时: ${action}`));
+            wrappedReject(new Error(`WebSocket API调用超时: ${action}`));
           }
         }, 15000); // 15秒超时
       } catch (error) {
         this.pendingRequests.delete(echo);
-        reject(new Error(`发送WebSocket请求失败: ${error.message}`));
+        wrappedReject(new Error(`发送WebSocket请求失败: ${error.message}`));
       }
     });
   }
@@ -3616,6 +4413,139 @@ class KiBotWebSocketServer {
   }
 
   /**
+   * 启动资源监控（CPU和内存）
+   */
+  startResourceMonitoring() {
+    // 初始化上一次CPU测量值
+    this.lastCpuUsage = process.cpuUsage();
+    this.lastCpuTime = Date.now();
+    this.cpuCores = os.cpus().length; // 获取CPU核心数
+    
+    const collectResourceData = () => {
+      const timestamp = Date.now();
+      
+      // CPU使用率计算
+      const currentCpuUsage = process.cpuUsage(this.lastCpuUsage);
+      const timeDiff = timestamp - this.lastCpuTime;
+      
+      // process.cpuUsage()返回微秒（microseconds）
+      // 转换为毫秒以匹配timeDiff的单位
+      const userMs = currentCpuUsage.user / 1000;
+      const systemMs = currentCpuUsage.system / 1000;
+      const totalCpuMs = userMs + systemMs;
+      
+      // CPU使用率 = (CPU时间 / 墙上时钟时间) * 100
+      // 这表示进程使用了多少百分比的CPU时间
+      let cpuPercent = (totalCpuMs / timeDiff) * 100;
+      
+      // 限制在合理范围内（0-100% for single core equivalency）
+      cpuPercent = Math.max(0, Math.min(100, cpuPercent));
+      
+      this.lastCpuUsage = process.cpuUsage();
+      this.lastCpuTime = timestamp;
+      
+      // 内存使用
+      const memUsage = process.memoryUsage();
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      
+      // 记录CPU历史
+      this.resourceStats.cpuHistory.push({
+        timestamp,
+        usage: cpuPercent
+      });
+      
+      // 记录内存历史
+      this.resourceStats.memoryHistory.push({
+        timestamp,
+        process: {
+          heapUsed: memUsage.heapUsed,
+          heapTotal: memUsage.heapTotal,
+          rss: memUsage.rss,
+          external: memUsage.external
+        },
+        system: {
+          total: totalMem,
+          free: freeMem,
+          used: usedMem,
+          usagePercent: (usedMem / totalMem) * 100
+        }
+      });
+      
+      // 只保留最近100条
+      if (this.resourceStats.cpuHistory.length > 100) {
+        this.resourceStats.cpuHistory.shift();
+      }
+      if (this.resourceStats.memoryHistory.length > 100) {
+        this.resourceStats.memoryHistory.shift();
+      }
+    };
+    
+    // 立即执行一次
+    collectResourceData();
+    
+    // 每10秒收集一次
+    this.resourceStats.interval = setInterval(collectResourceData, 10000);
+  }
+  
+  /**
+   * 停止资源监控
+   */
+  stopResourceMonitoring() {
+    if (this.resourceStats.interval) {
+      clearInterval(this.resourceStats.interval);
+      this.resourceStats.interval = null;
+    }
+  }
+
+  /**
+   * 启动事件循环延迟监控
+   */
+  // 事件循环监控已整合到系统统计模块中
+  
+  /**
+   * 记录HTTP请求
+   */
+  recordHttpRequest(action, responseTime, success = true) {
+    // 委托给统一的系统统计模块
+    this.systemStats.recordHttpRequest(action, responseTime, success, success ? 200 : 500);
+  }
+
+  /**
+   * 获取登录信息
+   */
+  async getLoginInfo() {
+    return this.callLLOneBotApi('get_login_info', {});
+  }
+
+  /**
+   * 获取系统性能数据
+   */
+  getSystemPerformance() {
+    // 委托给统一的系统统计模块
+    const perfData = this.systemStats.getPerformanceData();
+    const httpData = this.systemStats.getHttpStats();
+    const systemSummary = this.systemStats.getSystemSummary();
+    
+    return {
+      uptime: systemSummary.runtime.uptime,
+      timestamp: Date.now(),
+      cpu: perfData.cpu,
+      memory: perfData.memory,
+      eventLoop: perfData.eventLoop,
+      http: {
+        totalRequests: httpData.totalRequests,
+        totalErrors: httpData.totalErrors,
+        avgResponseTime: httpData.avgResponseTime,
+        errorRate: httpData.errorRate * 100,
+        topEndpoints: httpData.endpoints.slice(0, 10),
+        recentResponses: httpData.recentRequests.slice(-20)
+      }
+    };
+  }
+
+  /**
    * 获取登录信息
    */
   async getLoginInfo() {
@@ -3645,18 +4575,18 @@ class KiBotWebSocketServer {
    * @param {Object} event - 事件对象
    */
   broadcastEvent(event) {
-    // 添加调试日志
+    // 添加调试日志（仅在初始化完成且debug模式下）
     const eventType = event.post_type;
     const clientCount = this.clients.size;
     
-    console.log(`📡 [广播事件] 类型: ${eventType}, 客户端数量: ${clientCount}`);
+    if (this.isInitialized && process.env.LOG_LEVEL === 'debug') {
+      logger.debug('广播事件', `${eventType} -> ${clientCount} 个客户端`);
+    }
     
     let sentCount = 0;
     this.clients.forEach((client, clientId) => {
       // 检查客户端是否订阅了该事件类型
       const subscribedEvents = client.subscribedEvents || [];
-      
-      console.log(`   客户端 ${clientId}: 订阅=${JSON.stringify(subscribedEvents)}, 匹配=${subscribedEvents.length === 0 || subscribedEvents.includes(eventType)}`);
       
       if (subscribedEvents.length === 0 || subscribedEvents.includes(eventType)) {
         this.sendToClient(client.ws, {
@@ -3664,13 +4594,12 @@ class KiBotWebSocketServer {
           data: event
         });
         sentCount++;
-        console.log(`   ✅ 已发送事件到客户端 ${clientId}`);
-      } else {
-        console.log(`   ⏭️ 客户端 ${clientId} 未订阅此事件类型`);
       }
     });
     
-    console.log(`📡 [广播完成] 事件 ${eventType} 已发送到 ${sentCount}/${clientCount} 个客户端`);
+    if (this.isInitialized && process.env.LOG_LEVEL === 'debug') {
+      logger.debug('广播完成', `${eventType}: ${sentCount}/${clientCount}`);
+    }
   }
 
   /**
@@ -3736,11 +4665,11 @@ class KiBotWebSocketServer {
       if (fs.existsSync(groupsPath)) {
         const savedGroups = fs.readFileSync(groupsPath, 'utf8');
         this.groups = JSON.parse(savedGroups);
-        console.log(`📋 已加载 ${this.groups.length} 个规则分组`);
+        logger.startup('规则分组', `已加载 ${this.groups.length} 个`);
       } else {
         this.groups = this.getDefaultGroups();
         this.saveGroups();
-        console.log('📋 已创建默认规则分组');
+        logger.startup('规则分组', '已创建默认分组');
       }
     } catch (error) {
       console.error('加载规则分组失败:', error);
@@ -4440,6 +5369,9 @@ class KiBotWebSocketServer {
       return;
     }
     
+    // 记录插件执行统计（每个插件处理事件算一次执行）
+    systemStatistics.recordPluginExecution();
+    
     // 检查是否是指令消息
     if (event.post_type === 'message' && event.raw_message) {
       const message = event.raw_message.trim();
@@ -4509,15 +5441,14 @@ class KiBotWebSocketServer {
    * 停止服务器
    */
   async stop() {
-    console.log('🛑 停止WebSocket服务器...');
+    logger.info('服务器', '正在关闭...');
     
-    // 关闭安全中间件
-    if (this.securityMiddleware) {
+    // 关闭插件系统（优先关闭，确保Python进程正确终止）
+    if (this.pluginManager) {
       try {
-        this.securityMiddleware.shutdown();
-        console.log('🛡️ 安全中间件已关闭');
+        await this.pluginManager.shutdown();
       } catch (error) {
-        console.error('❌ 安全中间件关闭失败:', error);
+        logger.error('插件系统', '关闭失败: ' + error.message);
       }
     }
     
@@ -4525,34 +5456,35 @@ class KiBotWebSocketServer {
     if (this.taskManager) {
       try {
         this.taskManager.shutdown();
-        console.log('⏰ 任务管理器已关闭');
       } catch (error) {
-        console.error('❌ 任务管理器关闭失败:', error);
+        logger.error('任务管理器', '关闭失败: ' + error.message);
       }
     }
     
-    // 关闭监控数据管理器
-    if (monitorDataManager) {
+    // 关闭系统统计模块
+    if (systemStatistics) {
       try {
-        monitorDataManager.shutdown();
-        console.log('📊 监控数据管理器已关闭');
+        systemStatistics.stopAutoSave();
       } catch (error) {
-        console.error('❌ 监控数据管理器关闭失败:', error);
+        logger.error('系统统计', '关闭失败: ' + error.message);
       }
     }
     
-    // 关闭插件系统
-    if (this.pluginManager) {
+    // 关闭安全中间件
+    if (this.securityMiddleware) {
       try {
-        await this.pluginManager.shutdown();
-        console.log('🔌 插件系统已关闭');
+        this.securityMiddleware.shutdown();
       } catch (error) {
-        console.error('❌ 插件系统关闭失败:', error);
+        logger.error('安全中间件', '关闭失败: ' + error.message);
       }
     }
     
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
+    }
+    
+    if (this.autoCleanupInterval) {
+      clearInterval(this.autoCleanupInterval);
     }
     
     if (this.llonebotWs) {
@@ -4569,12 +5501,8 @@ class KiBotWebSocketServer {
     }
     
     if (this.server) {
-      this.server.close(() => {
-        console.log('✅ HTTP服务器已关闭');
-      });
+      this.server.close();
     }
-    
-    console.log('✅ WebSocket服务器已停止');
   }
 }
 
@@ -4584,15 +5512,47 @@ server.start();
 
 // 优雅关闭
 process.on('SIGINT', async () => {
-  console.log('\n📤 收到退出信号，正在关闭服务器...');
-  await server.stop();
-  process.exit(0);
+  console.log(''); // 换行
+  logger.info('服务器', '正在关闭...');
+  
+  // 设置超时保护，防止关闭过程卡住
+  const forceExitTimeout = setTimeout(() => {
+    logger.warn('关闭超时', '强制退出进程');
+    process.exit(1);
+  }, 5000); // 5秒超时
+  
+  try {
+    await server.stop();
+    clearTimeout(forceExitTimeout);
+    logger.success('服务器', '已安全关闭');
+    process.exit(0);
+  } catch (error) {
+    logger.error('关闭失败', error.message);
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\n📤 收到终止信号，正在关闭服务器...');
-  await server.stop();
-  process.exit(0);
+  console.log(''); // 换行
+  logger.info('服务器', '正在关闭...');
+  
+  // 设置超时保护
+  const forceExitTimeout = setTimeout(() => {
+    logger.warn('关闭超时', '强制退出进程');
+    process.exit(1);
+  }, 5000); // 5秒超时
+  
+  try {
+    await server.stop();
+    clearTimeout(forceExitTimeout);
+    logger.success('服务器', '已安全关闭');
+    process.exit(0);
+  } catch (error) {
+    logger.error('关闭失败', error.message);
+    clearTimeout(forceExitTimeout);
+    process.exit(1);
+  }
 });
 
 export default KiBotWebSocketServer;
